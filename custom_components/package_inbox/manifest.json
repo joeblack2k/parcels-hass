@@ -5,8 +5,8 @@
     "@joeblack2k"
   ],
   "documentation": "https://github.com/joeblack2k/parcels-hass",
-  "issue_tracker": "https://github.com/joeblack2k/parcels-hass/issues",
   "integration_type": "helper",
   "iot_class": "local_push",
+  "issue_tracker": "https://github.com/joeblack2k/parcels-hass/issues",
   "version": "0.2.0"
 }
