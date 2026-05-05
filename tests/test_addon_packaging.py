@@ -30,4 +30,7 @@ def test_fedex_scraper_addon_has_runtime_files():
     assert 'CMD ["/run.sh"]' in dockerfile
     assert run_script.exists()
     assert app.exists()
-    assert 'Path("/data/options.json")' in app.read_text()
+    app_text = app.read_text()
+    assert 'Path("/data/options.json")' in app_text
+    assert 'return ["0.0.0.0", "::"]' in app_text
+    assert 'addon_options.get("timeout")' in app_text

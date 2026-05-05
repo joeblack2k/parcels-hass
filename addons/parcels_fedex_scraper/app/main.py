@@ -54,12 +54,12 @@ def settings_from_env() -> Settings:
         port=parse_int(os.environ.get("PORT"), parse_int(addon_options.get("port"), 8765)),
         token=os.environ.get("SCRAPER_TOKEN") or str(addon_options.get("scraper_token") or ""),
         headless=parse_bool(
-            os.environ.get("FEDEX_SCRAPER_HEADLESS"),
-            parse_bool(addon_options.get("headless"), True),
+            addon_options.get("headless"),
+            parse_bool(os.environ.get("FEDEX_SCRAPER_HEADLESS"), True),
         ),
         timeout=parse_int(
-            os.environ.get("FEDEX_SCRAPER_TIMEOUT"),
-            parse_int(addon_options.get("timeout"), 45),
+            addon_options.get("timeout"),
+            parse_int(os.environ.get("FEDEX_SCRAPER_TIMEOUT"), 45),
         ),
     )
 
@@ -138,12 +138,19 @@ async def track(request: web.Request) -> web.Response:
         tracking_code=quote_plus(tracking_code)
     )
     timeout = request.app["settings"].timeout
-    result = await scrape_fedex(
-        request.app["browser"],
-        tracking_code=tracking_code,
-        tracking_url=tracking_url,
-        timeout=timeout,
-    )
+    try:
+        result = await asyncio.wait_for(
+            scrape_fedex(
+                request.app["browser"],
+                tracking_code=tracking_code,
+                tracking_url=tracking_url,
+                timeout=timeout,
+            ),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        LOG.info("FedEx scrape timed out after %ss for %s", timeout, redact_tracking_code(tracking_code))
+        result = error_update(tracking_code, tracking_url, f"scraper_timeout_{timeout}s")
     LOG.info(
         "FedEx tracking %s -> status=%s error=%s source=%s",
         redact_tracking_code(tracking_code),
@@ -483,10 +490,20 @@ def create_app(settings: Settings | None = None) -> web.Application:
     return app
 
 
+def bind_hosts(host: str) -> str | list[str]:
+    """Listen on both address families when Supervisor DNS advertises both."""
+
+    if host in {"", "0.0.0.0", "::"}:
+        return ["0.0.0.0", "::"]
+    return host
+
+
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     settings = settings_from_env()
-    web.run_app(create_app(settings), host=settings.host, port=settings.port)
+    hosts = bind_hosts(settings.host)
+    LOG.info("Starting Parcels FedEx scraper on %s:%s", hosts, settings.port)
+    web.run_app(create_app(settings), host=hosts, port=settings.port)
 
 
 if __name__ == "__main__":

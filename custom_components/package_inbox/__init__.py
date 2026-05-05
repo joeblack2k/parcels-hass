@@ -731,10 +731,10 @@ class PackageInboxManager:
     def _tracking_skip_reason(self, record: dict[str, Any], *, force: bool) -> str | None:
         if not record.get("tracking_code"):
             return "missing_tracking_code"
-        if record.get("status") in (STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"):
-            return "terminal_status"
         if force:
             return None
+        if record.get("status") in (STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"):
+            return "terminal_status"
 
         last_checked = dt_util.parse_datetime(str(record.get("tracking_last_checked") or ""))
         if not last_checked:
