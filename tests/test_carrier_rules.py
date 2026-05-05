@@ -23,9 +23,14 @@ from custom_components.package_inbox.carrier_rules import (
 def test_normalizes_parcel_app_nl_carrier_ids():
     assert normalize_carrier("dhlnl") == "dhl"
     assert normalize_carrier("dhlnlpcode") == "dhl"
+    assert normalize_carrier("glsnl") == "gls"
     assert normalize_carrier("tntp") == "postnl"
     assert normalize_carrier("tntpit") == "postnl"
     assert normalize_carrier("chrono") == "chronopost"
+    assert normalize_carrier("trnkrpcode") == "trunkrs"
+    assert normalize_carrier("cyclpcode") == "cycloon"
+    assert normalize_carrier("redjep") == "instabox"
+    assert normalize_carrier("transm") == "transmission"
 
 
 def test_detects_carrier_from_tracking_urls():
@@ -36,6 +41,9 @@ def test_detects_carrier_from_tracking_urls():
         detect_carrier("https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF")
         == "chronopost"
     )
+    assert detect_carrier("https://parcel.trunkrs.nl/400123456/1234AB") == "trunkrs"
+    assert detect_carrier("https://www.cycloon.eu/trackandtrace") == "cycloon"
+    assert detect_carrier("https://track.dynalogic.eu/?tracking=ABC123") == "dynalogic"
 
 
 def test_extracts_fedex_postnl_and_dhl_codes():
@@ -43,6 +51,8 @@ def test_extracts_fedex_postnl_and_dhl_codes():
     assert extract_tracking_code("Barcode 3SBVMS6743345", "postnl") == "3SBVMS6743345"
     assert extract_tracking_code("Zendingsnummer JJD000090254000059755497", "dhl") == "JJD000090254000059755497"
     assert extract_tracking_code("Your parcel XU152297803JF / 343431803222365", "chrono") == "XU152297803JF"
+    assert extract_tracking_code("Trunkrs number 400123456", "trunkrs") == "400123456"
+    assert extract_tracking_code("Homerr code HMR12345678901234", "homerr") == "HMR12345678901234"
 
 
 def test_validates_extended_fedex_shapes():

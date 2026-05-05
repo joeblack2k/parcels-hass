@@ -57,10 +57,20 @@ PACKAGE_WORDS = (
 CARRIER_KEYWORDS = {
     "postnl": ("postnl", "post nl", "mijn postnl", "3s"),
     "dhl": ("dhl", "jvgl", "jjd"),
-    "dpd": ("dpd",),
-    "gls": ("gls",),
+    "dpd": ("dpd", "dpd group"),
+    "gls": ("gls", "gls netherlands", "glsnl"),
     "fedex": ("fedex", "fedex express"),
     "chronopost": ("chronopost", "chronopost.fr", "chrono"),
+    "ups": ("ups", "united parcel service", "1z"),
+    "trunkrs": ("trunkrs",),
+    "homerr": ("homerr",),
+    "cycloon": ("cycloon", "cycloon fietskoeriers"),
+    "instabox": ("instabox", "red je pakketje", "redjep"),
+    "transmission": ("transmission", "trans-mission", "trans mission"),
+    "dachser": ("dachser",),
+    "dynalogic": ("dynalogic", "mydynalogic"),
+    "gofo": ("gofo", "gofo express"),
+    "dragonfly": ("dragonfly", "dragonfly netherlands"),
     "amazon": ("amazon",),
     "vinted": ("vinted",),
     "apotheek": ("benu", "apotheek", "medicijn", "medicatie"),
@@ -199,7 +209,7 @@ def parse_email(
 
     carrier = _detect_carrier(combined)
     tracking_code = _extract_tracking_code(combined, carrier)
-    tracking_url = _extract_tracking_url(combined, tracking_code)
+    tracking_url = _extract_tracking_url(combined, tracking_code, carrier)
     expected_date = _extract_expected_date(combined, today)
     window_start, window_end = _extract_time_window(combined)
     status = _extract_status(combined, expected_date, today)
@@ -379,7 +389,7 @@ def _detect_carrier(value: str) -> str:
     if "benu" in lowered or "apotheek" in lowered:
         return "apotheek"
     rule_carrier = detect_rule_carrier(value)
-    if rule_carrier in {"postnl", "dhl", "fedex", "chronopost"}:
+    if rule_carrier != "unknown":
         return rule_carrier
     for carrier, keywords in CARRIER_KEYWORDS.items():
         if any(keyword in lowered for keyword in keywords):
@@ -405,6 +415,12 @@ def _extract_tracking_code(value: str, carrier: str) -> str | None:
             r"(?<![A-Z0-9])[A-Z]{2}\d{9}[A-Z]{2}(?![A-Z0-9])",
             r"(?<!\d)\d{13,15}(?!\d)",
         ),
+        "ups": (r"(?<![A-Z0-9])1Z[A-Z0-9]{16}(?![A-Z0-9])",),
+        "trunkrs": (r"(?<!\d)4\d{7,15}(?!\d)",),
+        "homerr": (r"(?<![A-Z0-9])HMR[A-Z0-9]{14}(?![A-Z0-9])",),
+        "cycloon": (r"(?<![A-Z0-9])FKS[A-Z0-9]{6,24}(?![A-Z0-9])",),
+        "transmission": (r"(?<![A-Z0-9])T[A-Z0-9]{14}(?![A-Z0-9])",),
+        "gofo": (r"(?<![A-Z0-9])GF\d{10,20}(?![A-Z0-9])",),
     }
     for pattern in carrier_patterns.get(carrier, ()):
         for source in (value, compact):
@@ -449,6 +465,11 @@ def _extract_tracking_code_from_url(value: str) -> str | None:
             "key",
             "listeNumerosLT",
             "listenumeroslt",
+            "shipment",
+            "shipmentNumber",
+            "shipmentnumber",
+            "zending",
+            "zendingnummer",
         ):
             for item in query.get(key, []):
                 code = re.sub(r"[^A-Z0-9]", "", unquote(item).upper())
@@ -457,13 +478,29 @@ def _extract_tracking_code_from_url(value: str) -> str | None:
     return None
 
 
-def _extract_tracking_url(value: str, tracking_code: str | None) -> str | None:
-    if not tracking_code:
-        return None
-    code = tracking_code.lower()
+def _extract_tracking_url(value: str, tracking_code: str | None, carrier: str | None = None) -> str | None:
+    code = (tracking_code or "").lower()
     for url in _extract_urls(value):
         normalized = url.lower()
-        if code in normalized or f"tc={code}" in normalized or f"tracking-id={code}" in normalized:
+        if code and (code in normalized or f"tc={code}" in normalized or f"tracking-id={code}" in normalized):
+            return url
+    for url in _extract_urls(value):
+        detected = detect_rule_carrier(url)
+        if carrier and detected == carrier:
+            return url
+        host = urlparse(url).netloc.lower()
+        if carrier and carrier in {
+            "trunkrs",
+            "homerr",
+            "cycloon",
+            "instabox",
+            "transmission",
+            "dachser",
+            "dynalogic",
+            "gofo",
+            "dragonfly",
+            "ups",
+        } and any(keyword in host for keyword in CARRIER_KEYWORDS.get(carrier, ())):
             return url
     return None
 
@@ -495,10 +532,14 @@ def _valid_tracking_code(code: str, carrier: str) -> bool:
         return valid_rule_tracking_code(code, "postnl")
     if carrier == "dpd":
         return bool(re.fullmatch(r"\d{12,16}", code))
+    if carrier == "gls":
+        return 8 <= len(code) <= 14
     if carrier == "fedex":
         return valid_rule_tracking_code(code, "fedex")
     if carrier == "chronopost":
         return valid_rule_tracking_code(code, "chronopost")
+    if carrier in {"ups", "trunkrs", "homerr", "cycloon", "transmission", "gofo"}:
+        return valid_rule_tracking_code(code, carrier)
     return 6 <= len(code) <= 40
 
 
@@ -567,14 +608,32 @@ def _extract_status(value: str, expected_date: str | None, today: date) -> str:
             "is bezorgd",
             "werd bezorgd",
             "pakket bezorgd",
+            "bezorgd bij",
             "delivered",
             "afgeleverd:",
             "afgeleverd.",
             "is afgeleverd",
             "werd afgeleverd",
+            "geleverd bij",
         )
     ):
         return STATUS_DELIVERED
+    if any(
+        term in lowered
+        for term in (
+            "out for delivery",
+            "in delivery",
+            "onderweg voor bezorging",
+            "chauffeur is onderweg",
+            "bezorger is onderweg",
+            "wordt vandaag bezorgd",
+            "vandaag bezorgd",
+            "vandaag geleverd",
+        )
+    ):
+        if expected_date and expected_date != today.isoformat():
+            return STATUS_IN_TRANSIT
+        return STATUS_EXPECTED_TODAY
     if expected_date == today.isoformat():
         return STATUS_EXPECTED_TODAY
     if expected_date:
@@ -588,6 +647,12 @@ def _extract_status(value: str, expected_date: str | None, today: date) -> str:
             "on the way",
             "on its way",
             "handled in our network",
+            "picked up by the carrier",
+            "gesorteerd",
+            "sortering",
+            "aangemeld",
+            "shipment information received",
+            "label created",
         )
     ):
         return STATUS_IN_TRANSIT

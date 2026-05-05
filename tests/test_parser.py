@@ -35,6 +35,39 @@ def test_dhl_delivery_window():
     assert records[0]["delivery_window_end"] == "17:00"
 
 
+def test_trunkrs_mail_uses_postcode_tracking_link():
+    records = parse_email(
+        subject="Je Trunkrs pakket wordt vandaag bezorgd",
+        sender="Trunkrs <noreply@trunkrs.nl>",
+        text=(
+            "Je pakket is onderweg voor bezorging. "
+            "Trunkrs number 400123456. "
+            "Volg je pakket via https://parcel.trunkrs.nl/400123456/1234AB"
+        ),
+        today=TODAY,
+    )
+
+    assert len(records) == 1
+    assert records[0]["carrier"] == "trunkrs"
+    assert records[0]["tracking_code"] == "400123456"
+    assert records[0]["tracking_url"] == "https://parcel.trunkrs.nl/400123456/1234AB"
+    assert records[0]["status"] == "expected_today"
+
+
+def test_homerr_mail_extracts_pickup_code():
+    records = parse_email(
+        subject="Je Homerr pakket ligt klaar",
+        sender="Homerr <noreply@homerr.com>",
+        text="Je pakket ligt klaar bij het Homerr pakketpunt. Afhaalcode: HMR12345678901234",
+        today=TODAY,
+    )
+
+    assert len(records) == 1
+    assert records[0]["carrier"] == "homerr"
+    assert records[0]["tracking_code"] == "HMR12345678901234"
+    assert records[0]["status"] == "ready_for_pickup"
+
+
 def test_vinted_pickup_code():
     records = parse_email(
         subject="Je Vinted pakket ligt klaar",

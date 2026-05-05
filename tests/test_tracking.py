@@ -39,6 +39,10 @@ def test_builds_postnl_tracking_url():
         build_tracking_url("tntp", "3SBVMS6743345")
         == "https://www.postnl.nl/tracktrace/?B=3SBVMS6743345"
     )
+    assert (
+        build_tracking_url("tntp", "3SBVMS6743345", delivery_postcode="1234 AB")
+        == "https://www.postnl.nl/tracktrace/?B=3SBVMS6743345&P=1234AB&D=NL"
+    )
 
 
 def test_builds_dhl_ecommerce_tracking_url_and_api_url():
@@ -74,6 +78,18 @@ def test_builds_chronopost_tracking_url_from_parcel_app_code():
         build_tracking_url("chrono", "XU152297803JF")
         == "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF"
     )
+
+
+def test_builds_postcode_aware_urls_for_nl_carriers():
+    assert (
+        build_tracking_url("trnkrpcode", "400123456", delivery_postcode="1234 AB", delivery_house_number="12")
+        == "https://parcel.trunkrs.nl/400123456/1234AB"
+    )
+    assert (
+        build_tracking_url("dynalogic", "ABC123", delivery_postcode="1234 AB", delivery_house_number="12")
+        == "https://track.dynalogic.eu/?tracking=ABC123&postalCode=1234AB&houseNumber=12"
+    )
+    assert build_tracking_url("ups", "1Z999AA10123456784") == "https://www.ups.com/track?tracknum=1Z999AA10123456784"
 
 
 def test_extracts_today_delivery_window_from_html():

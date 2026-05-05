@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 import json
 import re
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import urlencode, quote_plus
 
 from .carrier_rules import normalize_carrier
 from .const import (
@@ -24,7 +24,24 @@ from .const import (
 from .parser import clean_text
 
 
-PUBLIC_TRACKING_CARRIERS = {"postnl", "dhl", "dpd", "gls", "fedex", "chronopost"}
+PUBLIC_TRACKING_CARRIERS = {
+    "postnl",
+    "dhl",
+    "dpd",
+    "gls",
+    "fedex",
+    "chronopost",
+    "ups",
+    "trunkrs",
+    "homerr",
+    "cycloon",
+    "instabox",
+    "transmission",
+    "dachser",
+    "dynalogic",
+    "gofo",
+    "dragonfly",
+}
 
 TRACKING_URLS = {
     "postnl": "https://www.postnl.nl/tracktrace/?B={code}",
@@ -33,6 +50,16 @@ TRACKING_URLS = {
     "gls": "https://www.gls-info.nl/Tracking?match={code}",
     "fedex": "https://www.fedex.com/fedextrack/?trknbr={code}",
     "chronopost": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT={code}",
+    "ups": "https://www.ups.com/track?tracknum={code}",
+    "trunkrs": "https://parcel.trunkrs.nl/",
+    "homerr": "https://vintedgo.com/tracking",
+    "cycloon": "https://www.cycloon.eu/trackandtrace",
+    "instabox": "https://tracking.instabox.io/",
+    "transmission": "https://www.trans-mission.nl/track-trace/",
+    "dachser": "https://www.dachser.com/nl/en/tracking",
+    "dynalogic": "https://track.dynalogic.eu/",
+    "gofo": "https://www.gofoexpress.com/track",
+    "dragonfly": "https://www.dragonflyshipping.com/track",
 }
 
 BLOCKED_HINTS = (
@@ -57,8 +84,11 @@ BLOCKED_HINTS = (
 
 HUMAN_REQUIRED_HINTS = (
     "postcode",
+    "postalcode",
     "zip code",
     "postal code",
+    "huisnummer",
+    "house number",
     "log in",
     "login",
     "sign in",
@@ -66,19 +96,65 @@ HUMAN_REQUIRED_HINTS = (
 
 TRACKING_BLOCKED_ERROR = "tracking_page_blocked_or_permission"
 
-def build_tracking_url(carrier: str | None, tracking_code: str | None) -> str | None:
+def build_tracking_url(
+    carrier: str | None,
+    tracking_code: str | None,
+    *,
+    delivery_postcode: str | None = None,
+    delivery_house_number: str | None = None,
+) -> str | None:
     """Build the public tracking URL for a carrier/code pair."""
     carrier_slug = normalize_carrier(carrier)
     code = (tracking_code or "").strip()
+    postcode = _normalize_postcode(delivery_postcode)
+    house_number = _normalize_house_number(delivery_house_number)
+    if carrier_slug == "postnl" and code and postcode:
+        return "https://www.postnl.nl/tracktrace/?" + urlencode(
+            {
+                "B": code,
+                "P": postcode,
+                "D": "NL",
+            }
+        )
     if carrier_slug == "dhl" and code.upper().startswith("JJD"):
         return f"https://my.dhlecommerce.nl/go-track-trace?role=consumer-receiver&tc={quote_plus(code)}"
+    if carrier_slug == "ups" and code:
+        return TRACKING_URLS["ups"].format(code=quote_plus(code))
+    if carrier_slug == "trunkrs":
+        if code and postcode:
+            return f"https://parcel.trunkrs.nl/{quote_plus(code)}/{quote_plus(postcode)}"
+        return TRACKING_URLS["trunkrs"]
+    if carrier_slug == "dynalogic":
+        query = _tracking_query(
+            {
+                "tracking": code,
+                "postalCode": postcode,
+                "houseNumber": house_number,
+            }
+        )
+        return f"{TRACKING_URLS['dynalogic']}?{query}" if query else TRACKING_URLS["dynalogic"]
+    if carrier_slug in {"homerr", "cycloon", "instabox", "transmission", "dachser", "gofo", "dragonfly"}:
+        query = _tracking_query(
+            {
+                "tracking": code,
+                "postalCode": postcode,
+                "houseNumber": house_number,
+            }
+        )
+        return f"{TRACKING_URLS[carrier_slug]}?{query}" if query else TRACKING_URLS[carrier_slug]
     template = TRACKING_URLS.get(carrier_slug)
     if not template or not code:
         return None
     return template.format(code=quote_plus(code))
 
 
-def build_tracking_api_url(carrier: str | None, tracking_code: str | None) -> str | None:
+def build_tracking_api_url(
+    carrier: str | None,
+    tracking_code: str | None,
+    *,
+    delivery_postcode: str | None = None,
+    delivery_house_number: str | None = None,
+) -> str | None:
     """Build a public JSON endpoint when a carrier exposes one without login."""
     carrier_slug = normalize_carrier(carrier)
     code = (tracking_code or "").strip()
@@ -95,6 +171,20 @@ def build_tracking_api_url(carrier: str | None, tracking_code: str | None) -> st
 def supports_public_tracking(carrier: str | None) -> bool:
     """Return whether this carrier has a public page adapter."""
     return normalize_carrier(carrier) in PUBLIC_TRACKING_CARRIERS
+
+
+def _tracking_query(values: dict[str, str | None]) -> str:
+    return urlencode({key: value for key, value in values.items() if value})
+
+
+def _normalize_postcode(value: str | None) -> str | None:
+    text = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    return text or None
+
+
+def _normalize_house_number(value: str | None) -> str | None:
+    text = re.sub(r"\s+", "", str(value or "").strip())
+    return text or None
 
 
 def extract_tracking_update(

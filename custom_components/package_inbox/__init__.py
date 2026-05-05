@@ -30,6 +30,8 @@ from homeassistant.util import dt as dt_util
 from .carrier_rules import normalize_carrier
 from .const import (
     CONF_AI_TASK_ENTITY,
+    CONF_DELIVERY_HOUSE_NUMBER,
+    CONF_DELIVERY_POSTCODE,
     CONF_ENABLE_AI_CLASSIFICATION,
     CONF_ENABLE_AI_FALLBACK,
     CONF_ENABLE_EVENT_LISTENER,
@@ -43,6 +45,8 @@ from .const import (
     CONF_TRACKING_TIMEOUT,
     CONF_TRACKING_USER_AGENT,
     DEFAULT_AI_TASK_ENTITY,
+    DEFAULT_DELIVERY_HOUSE_NUMBER,
+    DEFAULT_DELIVERY_POSTCODE,
     DEFAULT_MATRIX_ROOM_ID,
     DEFAULT_NOTIFY_SCRIPT,
     DEFAULT_POSTNL_DELIVERY_SENSOR,
@@ -85,6 +89,11 @@ from .window import DEFAULT_WINDOW_MARGIN_MINUTES, build_delivery_snapshot, dedu
 
 _LOGGER = logging.getLogger(__name__)
 
+AI_CARRIER_LIST = (
+    "postnl|dhl|dpd|gls|fedex|chronopost|ups|trunkrs|homerr|cycloon|instabox|"
+    "transmission|dachser|dynalogic|gofo|dragonfly|amazon|vinted|apotheek|unknown"
+)
+
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
@@ -93,6 +102,8 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_NOTIFY_SCRIPT, default=DEFAULT_NOTIFY_SCRIPT): cv.string,
                 vol.Optional(CONF_MATRIX_ROOM_ID, default=DEFAULT_MATRIX_ROOM_ID): cv.string,
                 vol.Optional(CONF_AI_TASK_ENTITY, default=DEFAULT_AI_TASK_ENTITY): cv.string,
+                vol.Optional(CONF_DELIVERY_POSTCODE, default=DEFAULT_DELIVERY_POSTCODE): cv.string,
+                vol.Optional(CONF_DELIVERY_HOUSE_NUMBER, default=DEFAULT_DELIVERY_HOUSE_NUMBER): cv.string,
                 vol.Optional(CONF_ENABLE_AI_CLASSIFICATION, default=True): cv.boolean,
                 vol.Optional(CONF_ENABLE_AI_FALLBACK, default=True): cv.boolean,
                 vol.Optional(CONF_POSTNL_DELIVERY_SENSOR, default=DEFAULT_POSTNL_DELIVERY_SENSOR): cv.string,
@@ -755,13 +766,18 @@ class PackageInboxManager:
                 supported=False,
             )
 
-        api_url = build_tracking_api_url(carrier, tracking_code)
+        api_url = build_tracking_api_url(
+            carrier,
+            tracking_code,
+            delivery_postcode=self.config.get(CONF_DELIVERY_POSTCODE),
+            delivery_house_number=self.config.get(CONF_DELIVERY_HOUSE_NUMBER),
+        )
         if api_url:
             api_update = await self._async_fetch_tracking_api(record, api_url)
             if api_update:
                 return api_update
 
-        url = _preferred_tracking_page_url(record)
+        url = _preferred_tracking_page_url(record, self.config)
         if not url:
             return _tracking_error_update(
                 record,
@@ -844,7 +860,12 @@ class PackageInboxManager:
                         f"tracking_api_http_{response.status}",
                         source="public_tracking_api",
                         supported=True,
-                        url=build_tracking_url(record.get("carrier"), record.get("tracking_code")),
+                        url=build_tracking_url(
+                            record.get("carrier"),
+                            record.get("tracking_code"),
+                            delivery_postcode=self.config.get(CONF_DELIVERY_POSTCODE),
+                            delivery_house_number=self.config.get(CONF_DELIVERY_HOUSE_NUMBER),
+                        ),
                     )
                 try:
                     payload = json.loads(text)
@@ -856,7 +877,12 @@ class PackageInboxManager:
                         "tracking_api_not_found",
                         source="public_tracking_api",
                         supported=True,
-                        url=build_tracking_url(record.get("carrier"), record.get("tracking_code")),
+                        url=build_tracking_url(
+                            record.get("carrier"),
+                            record.get("tracking_code"),
+                            delivery_postcode=self.config.get(CONF_DELIVERY_POSTCODE),
+                            delivery_house_number=self.config.get(CONF_DELIVERY_HOUSE_NUMBER),
+                        ),
                     )
                 update = extract_tracking_update_from_json(
                     carrier=str(record.get("carrier") or "unknown"),
@@ -873,7 +899,12 @@ class PackageInboxManager:
                 "tracking_api_timeout",
                 source="public_tracking_api",
                 supported=True,
-                url=build_tracking_url(record.get("carrier"), record.get("tracking_code")),
+                url=build_tracking_url(
+                    record.get("carrier"),
+                    record.get("tracking_code"),
+                    delivery_postcode=self.config.get(CONF_DELIVERY_POSTCODE),
+                    delivery_house_number=self.config.get(CONF_DELIVERY_HOUSE_NUMBER),
+                ),
             )
         except ClientError as err:
             _LOGGER.debug("Tracking API failed for %s: %s", record.get("key"), err)
@@ -1056,13 +1087,14 @@ class PackageInboxManager:
         instructions = (
             "Je bent een filter voor een Home Assistant pakketmelder. "
             "Bepaal of deze e-mail echt over een pakket of afhaalpakket gaat. "
-            "Een pakket is PostNL/DHL/DPD/GLS/FedEx/Chronopost/Amazon/Vinted verzending, track-and-trace, bezorging van een webwinkelpakket, "
+            "Een pakket is PostNL/DHL/DPD/GLS/FedEx/Chronopost/UPS/Trunkrs/Homerr/Cycloon/Instabox/"
+            "TransMission/Dachser/Dynalogic/GOFO/Dragonfly/Amazon/Vinted verzending, track-and-trace, bezorging van een webwinkelpakket, "
             "een afhaalcode/QR voor een pakketpunt, of een apotheek/medicijnbestelling die met code opgehaald moet worden. "
             "NIET als pakket tellen: Picnic/AH/Jumbo/Crisp/Flink boodschappenbezorging, maaltijdbezorging, gewone winkelbestellingen "
             "zonder verzendinformatie, nieuwsbrieven, supportberichten, retourdiscussies of Vinted chat/supportberichten zonder verzending. "
             "Let sterk op afzenderidentiteit en domein. Return ONLY geldige JSON.\n\n"
             "JSON-vorm: {\"is_package\":true|false,\"category\":\"parcel|pickup|medicine_pickup|grocery_delivery|food_delivery|order_only|support|newsletter|other\","
-            "\"carrier\":\"postnl|dhl|dpd|gls|fedex|chronopost|amazon|vinted|apotheek|unknown|null\",\"shop\":null,"
+            f"\"carrier\":\"{AI_CARRIER_LIST}|null\",\"shop\":null,"
             "\"confidence\":\"low|medium|high\",\"reason\":\"korte reden\"}\n\n"
             f"Afzenderidentiteit: {sender_identity}\n"
             f"E-mail:\n{redacted}"
@@ -1129,7 +1161,7 @@ class PackageInboxManager:
             "Normale track-and-trace codes mogen in tracking_code. "
             "Apotheek- of medicijnbestellingen die met een code opgehaald moeten worden zijn ready_for_pickup met carrier apotheek. "
             "Gebruik status: expected_today, in_transit, ready_for_pickup, delivered, picked_up, cancelled of unknown.\n\n"
-            "JSON-vorm: {\"packages\":[{\"carrier\":\"postnl|dhl|dpd|gls|fedex|amazon|vinted|apotheek|unknown\","
+            f"JSON-vorm: {{\"packages\":[{{\"carrier\":\"{AI_CARRIER_LIST}\","
             "\"shop\":null,\"tracking_code\":null,\"status\":\"unknown\",\"expected_date\":null,"
             "\"delivery_window_start\":null,\"delivery_window_end\":null,\"pickup_location\":null,"
             "\"pickup_code\":null,\"confidence\":\"low|medium|high\"}]}\n\n"
@@ -1827,12 +1859,18 @@ def _merge_tracking_update(
     return merged
 
 
-def _preferred_tracking_page_url(record: dict[str, Any]) -> str | None:
+def _preferred_tracking_page_url(record: dict[str, Any], config: dict[str, Any] | None = None) -> str | None:
     """Prefer the exact tracking link from the mail before a generic carrier URL."""
     existing = _clean_optional(record.get("tracking_url"))
     if existing and existing.lower().startswith(("http://", "https://")):
         return existing
-    return build_tracking_url(record.get("carrier"), record.get("tracking_code"))
+    config = config or {}
+    return build_tracking_url(
+        record.get("carrier"),
+        record.get("tracking_code"),
+        delivery_postcode=config.get(CONF_DELIVERY_POSTCODE),
+        delivery_house_number=config.get(CONF_DELIVERY_HOUSE_NUMBER),
+    )
 
 
 def _redact_tracking_url_for_ai(url: str | None) -> str:
@@ -1896,13 +1934,33 @@ def _bool_optional(value: Any) -> bool | None:
 def _carrier_slug(value: Any) -> str:
     text = clean_text(str(value or "unknown")).lower()
     normalized = normalize_carrier(text)
-    if normalized in {"postnl", "dhl", "fedex", "chronopost"}:
+    if normalized != "unknown":
         return normalized
     if "post" in text and "nl" in text:
         return "postnl"
     if "benu" in text or "apotheek" in text or "pharmacy" in text:
         return "apotheek"
-    for carrier in ("postnl", "dhl", "dpd", "gls", "fedex", "chronopost", "amazon", "vinted", "apotheek"):
+    for carrier in (
+        "postnl",
+        "dhl",
+        "dpd",
+        "gls",
+        "fedex",
+        "chronopost",
+        "ups",
+        "trunkrs",
+        "homerr",
+        "cycloon",
+        "instabox",
+        "transmission",
+        "dachser",
+        "dynalogic",
+        "gofo",
+        "dragonfly",
+        "amazon",
+        "vinted",
+        "apotheek",
+    ):
         if carrier in text:
             return carrier
     return "unknown" if not text else text[:32]
@@ -1940,6 +1998,16 @@ def _carrier_title(value: Any) -> str:
         "gls": "GLS",
         "fedex": "FedEx",
         "chronopost": "Chronopost",
+        "ups": "UPS",
+        "trunkrs": "Trunkrs",
+        "homerr": "Homerr",
+        "cycloon": "Cycloon",
+        "instabox": "Instabox",
+        "transmission": "TransMission",
+        "dachser": "Dachser",
+        "dynalogic": "Dynalogic",
+        "gofo": "GOFO Express",
+        "dragonfly": "Dragonfly",
         "amazon": "Amazon",
         "vinted": "Vinted",
         "apotheek": "Apotheek",

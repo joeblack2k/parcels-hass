@@ -7,7 +7,24 @@ import re
 from urllib.parse import parse_qs, unquote, urlparse
 
 
-CANONICAL_CARRIERS = {"postnl", "dhl", "fedex", "chronopost"}
+CANONICAL_CARRIERS = {
+    "postnl",
+    "dhl",
+    "dpd",
+    "gls",
+    "fedex",
+    "chronopost",
+    "ups",
+    "trunkrs",
+    "homerr",
+    "cycloon",
+    "instabox",
+    "transmission",
+    "dachser",
+    "dynalogic",
+    "gofo",
+    "dragonfly",
+}
 
 CARRIER_ALIASES = {
     "postnl": (
@@ -23,11 +40,24 @@ CARRIER_ALIASES = {
         "dhl",
         "dhl parcel",
         "dhl ecommerce",
+        "dhl netherlands",
         "dhlnl",
         "dhlnlpcode",
         "dhlecommerce",
         "my.dhlecommerce",
         "api-gw.dhlparcel",
+    ),
+    "dpd": (
+        "dpd",
+        "dpd group",
+        "dpdgroup",
+        "dpd.com",
+    ),
+    "gls": (
+        "gls",
+        "gls netherlands",
+        "glsnl",
+        "gls-info",
     ),
     "fedex": (
         "fedex",
@@ -40,12 +70,78 @@ CARRIER_ALIASES = {
         "chronopost",
         "chronopost.fr",
     ),
+    "ups": (
+        "ups",
+        "ups.com",
+        "united parcel service",
+    ),
+    "trunkrs": (
+        "trunkrs",
+        "trnkrpcode",
+        "parcel.trunkrs",
+    ),
+    "homerr": (
+        "homerr",
+        "homerr.com",
+        "homerr pakketpunt",
+    ),
+    "cycloon": (
+        "cycloon",
+        "cycloon.eu",
+        "cyclpcode",
+    ),
+    "instabox": (
+        "instabox",
+        "red je pakketje",
+        "redjep",
+    ),
+    "transmission": (
+        "transmission",
+        "trans-mission",
+        "trans mission",
+        "transm",
+    ),
+    "dachser": (
+        "dachser",
+    ),
+    "dynalogic": (
+        "dynalogic",
+        "mydynalogic",
+    ),
+    "gofo": (
+        "gofo",
+        "gofo express",
+        "gofonl",
+    ),
+    "dragonfly": (
+        "dragonfly",
+        "dragonfly netherlands",
+        "dragonnl",
+    ),
 }
 
 URL_HOST_CARRIERS = (
+    ("parcel.trunkrs.nl", "trunkrs"),
+    ("trunkrs.nl", "trunkrs"),
+    ("homerr.com", "homerr"),
+    ("cycloon.eu", "cycloon"),
+    ("instabox.io", "instabox"),
+    ("redjepakketje.nl", "instabox"),
+    ("trans-mission.nl", "transmission"),
+    ("transmission.nl", "transmission"),
+    ("dachser.com", "dachser"),
+    ("dynalogic.eu", "dynalogic"),
+    ("mydynalogic.eu", "dynalogic"),
+    ("gofoexpress.com", "gofo"),
+    ("gofo.com", "gofo"),
+    ("dragonflyshipping.com", "dragonfly"),
+    ("ups.com", "ups"),
     ("chronopost.fr", "chronopost"),
     ("fedex.com", "fedex"),
     ("fcbtracking.fedex.com", "fedex"),
+    ("gls-info.nl", "gls"),
+    ("gls-group.eu", "gls"),
+    ("dpd.com", "dpd"),
     ("dhlecommerce.nl", "dhl"),
     ("dhlparcel.nl", "dhl"),
     ("dhl.com", "dhl"),
@@ -69,6 +165,10 @@ TRACKING_QUERY_KEYS = (
     "tracking_number",
     "trknbr",
     "listenumeroslt",
+    "shipment",
+    "shipmentnumber",
+    "zending",
+    "zendingnummer",
 )
 
 TRACKING_PATTERNS = {
@@ -81,6 +181,12 @@ TRACKING_PATTERNS = {
         r"(?<![A-Z0-9])(?:JJD|JD|JVGL)[A-Z0-9]{10,30}(?![A-Z0-9])",
         r"(?<![A-Z0-9])3S[A-Z0-9]{8,20}(?![A-Z0-9])",
     ),
+    "dpd": (
+        r"(?<!\d)\d{12,16}(?!\d)",
+    ),
+    "gls": (
+        r"(?<![A-Z0-9])[A-Z0-9]{8,14}(?![A-Z0-9])",
+    ),
     "fedex": (
         r"(?<!\d)\d{10,15}(?!\d)",
         r"(?<!\d)\d{20}(?!\d)",
@@ -89,6 +195,24 @@ TRACKING_PATTERNS = {
     "chronopost": (
         r"(?<![A-Z0-9])[A-Z]{2}\d{9}[A-Z]{2}(?![A-Z0-9])",
         r"(?<!\d)\d{13,15}(?!\d)",
+    ),
+    "ups": (
+        r"(?<![A-Z0-9])1Z[A-Z0-9]{16}(?![A-Z0-9])",
+    ),
+    "trunkrs": (
+        r"(?<!\d)4\d{7,15}(?!\d)",
+    ),
+    "homerr": (
+        r"(?<![A-Z0-9])HMR[A-Z0-9]{14}(?![A-Z0-9])",
+    ),
+    "cycloon": (
+        r"(?<![A-Z0-9])FKS[A-Z0-9]{6,24}(?![A-Z0-9])",
+    ),
+    "transmission": (
+        r"(?<![A-Z0-9])T[A-Z0-9]{14}(?![A-Z0-9])",
+    ),
+    "gofo": (
+        r"(?<![A-Z0-9])GF\d{10,20}(?![A-Z0-9])",
     ),
 }
 
@@ -109,6 +233,8 @@ def normalize_carrier(value: str | None) -> str:
         return "unknown"
     if "post" in text and "nl" in text:
         return "postnl"
+    if text in {"tntp", "tntpit", "tntpitp"}:
+        return "postnl"
     for carrier, aliases in CARRIER_ALIASES.items():
         if carrier == text or any(alias in text for alias in aliases):
             return carrier
@@ -126,12 +252,12 @@ def detect_carrier(value: str | None) -> str:
             if host_fragment in host:
                 return carrier
 
-    for carrier in ("chronopost", "fedex", "dhl", "postnl"):
+    for carrier in CARRIER_ALIASES:
         if any(alias in lowered for alias in CARRIER_ALIASES[carrier]):
             return carrier
 
     compact = re.sub(r"\s+", "", text.upper())
-    for carrier in ("dhl", "postnl"):
+    for carrier in CANONICAL_CARRIERS:
         if _first_matching_code(compact, carrier):
             return carrier
     return "unknown"
@@ -145,7 +271,7 @@ def extract_tracking_code(value: str | None, carrier: str | None = None) -> str 
     if url_code and valid_tracking_code(url_code, canonical):
         return url_code
 
-    carriers = (canonical,) if canonical in CANONICAL_CARRIERS else ("fedex", "dhl", "postnl", "chronopost")
+    carriers = (canonical,) if canonical in CANONICAL_CARRIERS else tuple(TRACKING_PATTERNS)
     for candidate_carrier in carriers:
         for source in (text, re.sub(r"\s+", "", text.upper())):
             match = _first_matching_code(source, candidate_carrier)
@@ -185,6 +311,8 @@ def valid_tracking_code(code: str | None, carrier: str | None = None) -> bool:
         return code.isdigit() and (10 <= len(code) <= 15 or len(code) in {20, 22})
     if canonical == "chronopost":
         return any(re.fullmatch(pattern, code) for pattern in TRACKING_PATTERNS["chronopost"])
+    if canonical in TRACKING_PATTERNS:
+        return any(re.fullmatch(pattern, code) for pattern in TRACKING_PATTERNS[canonical])
     return 6 <= len(code) <= 40
 
 

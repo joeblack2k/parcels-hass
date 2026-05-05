@@ -7,8 +7,8 @@ The public project name is **Parcels for Home Assistant**. The Home Assistant in
 ## What it does
 
 - Parses parcel mail from IMAP events.
-- Tracks PostNL, DHL, DPD, GLS, FedEx, Chronopost, Amazon, Vinted, and pickup-style messages where enough data is present.
-- Enriches public tracking pages for PostNL, DHL, DPD, GLS, FedEx, and Chronopost on a best-effort basis.
+- Tracks PostNL, DHL, DPD, GLS, FedEx, Chronopost, UPS, Trunkrs, Homerr, Cycloon, Instabox/Red je pakketje, TransMission, Dachser, Dynalogic, GOFO, Dragonfly, Amazon, Vinted, and pickup-style messages where enough data is present.
+- Enriches public tracking pages and mail-provided tracking links on a best-effort basis. Postcode and house-number settings are used only locally for carriers that need receiver address verification.
 - Uses the PostNL Home Assistant delivery sensor when configured.
 - Exposes dashboard sensors for active parcels, due-today parcels, pickup parcels, and delivery windows.
 - Provides services to add, edit, refresh, mark picked up, delete, and debug package records.
@@ -41,10 +41,22 @@ package_inbox:
   imap_entry_id: YOUR_IMAP_ENTRY_ID
   notify_script: script.your_package_notification_script
   matrix_room_id: ""
+  delivery_postcode: ""
+  delivery_house_number: ""
   postnl_delivery_sensor: sensor.postnl_delivery
   public_qr_dir: package_inbox
   tracking_refresh_minutes: 60
 ```
+
+For postcode-gated carrier tracking, set your local receiver details in Home Assistant YAML:
+
+```yaml
+package_inbox:
+  delivery_postcode: "1234AB"
+  delivery_house_number: "12"
+```
+
+Do not put personal receiver details in public bug reports or shared test fixtures.
 
 ## Services
 
@@ -71,6 +83,7 @@ V1 focuses on the current local-first flow:
 - IMAP/mail parsing.
 - PostNL Home Assistant delivery sensor support.
 - Public tracking enrichment for supported carriers.
+- Postcode-aware tracking URLs for carriers that expose that publicly.
 - Manual add, edit, status update, delete, and pickup summaries.
 - Dashboard sensors and Matrix/Home Assistant notification hooks.
 
@@ -98,7 +111,7 @@ The browser cookie bridge idea is tracked as a separate experimental/private spi
 
 ## Disclaimer
 
-This project is not affiliated with Parcel, Amazon, PostNL, DHL, DPD, GLS, FedEx, Chronopost, Vinted, Home Assistant, or HACS. Parcel REST API compatibility is planned as an optional source; see the official [Parcel API docs](https://parcelapp.net/help/api-view-deliveries.html) and the existing community integration [jmdevita/parcel-ha](https://github.com/jmdevita/parcel-ha) for prior art.
+This project is not affiliated with Parcel, Amazon, PostNL, DHL, DPD, GLS, FedEx, Chronopost, UPS, Trunkrs, Homerr, Cycloon, Instabox, TransMission, Dachser, Dynalogic, GOFO, Dragonfly, Vinted, Home Assistant, or HACS. Parcel REST API compatibility is planned as an optional source; see the official [Parcel API docs](https://parcelapp.net/help/api-view-deliveries.html) and the existing community integration [jmdevita/parcel-ha](https://github.com/jmdevita/parcel-ha) for prior art.
 
 ## Development
 

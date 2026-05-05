@@ -16,6 +16,30 @@ The integration is local-first today. Parcel REST API support should be optional
 - Supported-carrier registry and carrier aliases.
 - Dedupe against IMAP, PostNL, and public tracking sources.
 
+## Local-first carrier baseline
+
+The public integration should prefer IMAP/mail parsing first, then public carrier tracking pages or APIs when they are available without account secrets.
+
+Current Netherlands-oriented carrier targets:
+
+| Carrier | Parcel/app code hints | Baseline |
+| --- | --- | --- |
+| PostNL | `tntp`, `tntpit` | IMAP, PostNL HA sensor, postcode-aware public tracking |
+| DHL Netherlands | `dhlnl`, `dhlnlpcode` | IMAP, public DHL page/API |
+| GLS Netherlands | `glsnl` | IMAP, public tracking URL |
+| Trunkrs | `trnkrpcode` | IMAP, postcode-aware public tracking URL |
+| Homerr | `homerr` | IMAP, pickup/tracking code extraction, public tracking page |
+| Cycloon | `cyclpcode` | IMAP, public tracking page |
+| Instabox / Red je pakketje | `redjep` | IMAP, public tracking page |
+| TransMission | `transm` | IMAP, public tracking page/API research |
+| Dachser | `dachser` | IMAP, public tracking page |
+| Dynalogic | `dynalogic` | IMAP, postcode/house-number-aware public URL |
+| UPS | `ups` | IMAP, public tracking URL |
+| Amazon Netherlands | `amzlnl` | IMAP only; no cookies or account scraping in public flow |
+| Vinted Go | `vinted` | IMAP/pickup flow; public tracking page where mail provides enough data |
+
+Do not mark a carrier as fully supported unless parser fixtures and tracking-refresh behavior are covered by tests.
+
 ## Status-code mapping
 
 | Parcel code | Parcel label | Internal status |
