@@ -447,10 +447,15 @@ def extract_fedex_tracking_update_from_mail(
         update["tracking_status_text"] = status_text
 
     status = str(record.get("status") or "")
-    if status and status != STATUS_UNKNOWN:
+    inferred_status = _extract_status(raw_excerpt, expected_date, today)
+    if inferred_status in {STATUS_DELIVERED, STATUS_READY_FOR_PICKUP}:
+        update["status"] = inferred_status
+    elif expected_date == today.isoformat() and status not in {STATUS_DELIVERED, STATUS_READY_FOR_PICKUP}:
+        update["status"] = STATUS_EXPECTED_TODAY
+    elif status and status != STATUS_UNKNOWN:
         update["status"] = status
     else:
-        update["status"] = _extract_status(raw_excerpt, expected_date, today)
+        update["status"] = inferred_status
 
     if not (expected_date or status_text or update["status"] != STATUS_UNKNOWN):
         update["tracking_refresh_error"] = error or TRACKING_BLOCKED_ERROR
@@ -720,7 +725,10 @@ def _fedex_mail_status_text(raw_excerpt: str, expected_date: str | None) -> str 
     if not raw_excerpt:
         return None
     parts: list[str] = []
-    sender = re.search(r"(?i)uw zending van\s+(.+?)\s+is onderweg", raw_excerpt)
+    sender = re.search(
+        r"(?i)uw zending van\s+(.+?)\s+is\s+(?:onderweg|afgeleverd|bezorgd|geleverd)",
+        raw_excerpt,
+    )
     if sender:
         parts.append(clean_text(sender.group(1)))
     if expected_date:

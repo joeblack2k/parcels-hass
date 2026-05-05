@@ -280,6 +280,28 @@ def test_fedex_delivery_planned_date_tracking_url_and_shop():
     assert records[0]["tracking_url"].startswith("https://fedex.com/fedextrack")
     assert records[0]["expected_date"] == "2026-05-05"
     assert records[0]["status"] == "in_transit"
+    assert records[0]["delivery_window_start"] is None
+    assert records[0]["delivery_window_end"] is None
+
+
+def test_fedex_planned_delivery_today_is_expected_today_without_placeholder_window():
+    records = parse_email(
+        subject="Uw zending is onderweg 871354982751",
+        sender="FedEx Express <noreply@fedex.com>",
+        text=(
+            "Uw zending van Ubiquiti International Holding B.V. is onderweg. "
+            "Geplande leverdatum dinsdag, 05/05/2026. "
+            "Tracking-id 871354982751 Service FedEx Priority"
+        ),
+        today=date(2026, 5, 5),
+    )
+
+    assert len(records) == 1
+    assert records[0]["carrier"] == "fedex"
+    assert records[0]["status"] == "expected_today"
+    assert records[0]["expected_date"] == "2026-05-05"
+    assert records[0]["delivery_window_start"] is None
+    assert records[0]["delivery_window_end"] is None
 
 
 def test_fedex_trknbr_url_extracts_tracking_code():

@@ -265,5 +265,24 @@ def test_fedex_mail_fallback_keeps_mail_details_when_page_is_blocked():
     assert update["tracking_status_text"] == (
         "FedEx mail: Ubiquiti International Holding B.V. - gepland 2026-05-05 - FedEx Priority"
     )
-    assert update["status"] == "in_transit"
+    assert update["status"] == "expected_today"
     assert "delivery_window_start" not in update
+
+
+def test_fedex_mail_fallback_delivered_mail_overrides_previous_transit_status():
+    update = extract_fedex_tracking_update_from_mail(
+        record={
+            "carrier": "fedex",
+            "tracking_code": "871354982751",
+            "status": "in_transit",
+            "raw_excerpt": (
+                "Uw zending van Ubiquiti International Holding B.V. is afgeleverd. "
+                "Service FedEx Priority"
+            ),
+        },
+        error="tracking_page_blocked_or_permission",
+        today=date(2026, 5, 5),
+    )
+
+    assert update["status"] == "delivered"
+    assert update["tracking_status_text"] == "FedEx mail: Ubiquiti International Holding B.V. - FedEx Priority"

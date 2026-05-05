@@ -88,8 +88,7 @@ def build_delivery_snapshot(
 
 def _window_for_record(record: dict[str, Any], *, now: datetime) -> dict[str, Any] | None:
     expected_date = record.get("expected_date")
-    start = record.get("delivery_window_start")
-    end = record.get("delivery_window_end")
+    start, end = _valid_window_values(record)
     if not expected_date or not start or not end:
         return None
 
@@ -109,9 +108,6 @@ def _window_for_record(record: dict[str, Any], *, now: datetime) -> dict[str, An
 
     if end_dt < start_dt:
         end_dt += timedelta(days=1)
-    if end_dt == start_dt:
-        return None
-
     return {
         "record": record,
         "window_start_dt": start_dt,
@@ -151,15 +147,16 @@ def dedupe_delivery_records(records: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _window_key(record: dict[str, Any]) -> tuple[Any, ...] | None:
-    if not (record.get("delivery_window_start") or record.get("delivery_window_end")):
+    start, end = _valid_window_values(record)
+    if not start or not end:
         return None
     return (
         "window",
         record.get("carrier"),
         _normal_text(record.get("shop")),
         record.get("expected_date"),
-        record.get("delivery_window_start"),
-        record.get("delivery_window_end"),
+        start,
+        end,
     )
 
 
@@ -184,20 +181,36 @@ def _normal_text(value: Any) -> str:
 
 
 def _public_record(record: dict[str, Any]) -> dict[str, Any]:
+    start, end = _valid_window_values(record)
     return {
         "key": record.get("key"),
         "carrier": record.get("carrier"),
         "shop": record.get("shop"),
         "status": record.get("status"),
         "expected_date": record.get("expected_date"),
-        "delivery_window_start": record.get("delivery_window_start"),
-        "delivery_window_end": record.get("delivery_window_end"),
+        "delivery_window_start": start,
+        "delivery_window_end": end,
         "tracking_code": record.get("tracking_code"),
         "tracking_url": record.get("tracking_url"),
         "tracking_status_text": record.get("tracking_status_text"),
         "source": record.get("source"),
         "confidence": record.get("confidence"),
     }
+
+
+def _valid_window_values(record: dict[str, Any]) -> tuple[str | None, str | None]:
+    start = record.get("delivery_window_start")
+    end = record.get("delivery_window_end")
+    if not start or not end:
+        return (None, None)
+    try:
+        start_time = time.fromisoformat(str(start))
+        end_time = time.fromisoformat(str(end))
+    except ValueError:
+        return (None, None)
+    if start_time == end_time:
+        return (None, None)
+    return (str(start), str(end))
 
 
 def _public_window(window: dict[str, Any] | None) -> dict[str, Any] | None:

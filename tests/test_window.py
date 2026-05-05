@@ -172,3 +172,5 @@ def test_delivery_snapshot_ignores_zero_length_placeholder_window():
     assert snapshot["weight"] == 1
     assert snapshot["active_packages"] == []
     assert snapshot["windows"] == []
+    assert snapshot["packages"][0]["delivery_window_start"] is None
+    assert snapshot["packages"][0]["delivery_window_end"] is None

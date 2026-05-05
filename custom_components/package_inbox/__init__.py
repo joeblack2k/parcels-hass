@@ -1502,8 +1502,7 @@ class PackageInboxManager:
         if record.get("status") == STATUS_READY_FOR_PICKUP:
             return None
         carrier = _carrier_title(record.get("carrier"))
-        start = record.get("delivery_window_start")
-        end = record.get("delivery_window_end")
+        start, end = _valid_delivery_window(record)
         if start and end:
             return f"{carrier} vandaag tussen {start} en {end}"
         if record.get("expected_date") == dt_util.now().date().isoformat() or record.get("status") == STATUS_EXPECTED_TODAY:
@@ -1808,9 +1807,31 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
         "tracking_refresh_supported": _bool_optional(record.get("tracking_refresh_supported")),
         "extra": record.get("extra") if isinstance(record.get("extra"), dict) else {},
     }
+    _sanitize_delivery_window(normalized)
     if record.get("key"):
         normalized["key"] = str(record["key"])
     return normalized
+
+
+def _sanitize_delivery_window(record: dict[str, Any]) -> None:
+    start, end = _valid_delivery_window(record)
+    record["delivery_window_start"] = start
+    record["delivery_window_end"] = end
+
+
+def _valid_delivery_window(record: dict[str, Any]) -> tuple[str | None, str | None]:
+    start = record.get("delivery_window_start")
+    end = record.get("delivery_window_end")
+    if not start or not end:
+        return (None, None)
+    try:
+        start_time = time.fromisoformat(str(start))
+        end_time = time.fromisoformat(str(end))
+    except ValueError:
+        return (None, None)
+    if start_time == end_time:
+        return (None, None)
+    return (str(start), str(end))
 
 
 def _append_history(previous: dict[str, Any], current: dict[str, Any]) -> list[dict[str, Any]]:
