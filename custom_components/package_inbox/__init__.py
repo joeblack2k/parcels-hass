@@ -81,9 +81,12 @@ from .dashboard import build_dashboard_snapshot
 from .parser import clean_text, is_likely_package_email, parse_email, stable_key
 from .tracking import (
     TRACKING_BLOCKED_ERROR,
+    build_fedex_tracking_api_url,
+    build_fedex_tracking_payload,
     build_tracking_api_url,
     build_tracking_url,
     extract_fedex_tracking_update_from_mail,
+    extract_fedex_tracking_update_from_json,
     extract_tracking_update,
     extract_tracking_update_from_json,
     is_blocked_tracking_text,
@@ -368,6 +371,7 @@ class PackageInboxManager:
         refreshed: list[str] = []
         skipped: list[dict[str, str]] = []
         errors: list[dict[str, str]] = []
+        diagnostics: list[dict[str, Any]] = []
 
         for key, current in candidates:
             record = _normalize_record(current)
@@ -385,6 +389,7 @@ class PackageInboxManager:
                 errors.append({"key": key, "error": str(err)})
                 continue
 
+            diagnostics.append(_tracking_diagnostic(key, record, update))
             merged = _merge_tracking_update(current, update, dt_util.now().isoformat())
             stored = await self._async_store_records([merged], notify=notify)
             refreshed.extend(stored)
@@ -393,6 +398,7 @@ class PackageInboxManager:
             "refreshed": refreshed,
             "skipped": skipped,
             "errors": errors,
+            "diagnostics": diagnostics,
             "count": len(refreshed),
         }
 
@@ -769,6 +775,18 @@ class PackageInboxManager:
         if scraper_update and _tracking_update_has_delivery_detail(scraper_update):
             return scraper_update
 
+        if carrier == "fedex":
+            fedex_api_update = await self._async_fetch_fedex_public_api(record)
+            if fedex_api_update and _tracking_update_has_delivery_detail(fedex_api_update):
+                return fedex_api_update
+            mail_update = extract_fedex_tracking_update_from_mail(
+                record=record,
+                error=str((fedex_api_update or {}).get("tracking_refresh_error") or TRACKING_BLOCKED_ERROR),
+                today=dt_util.now().date(),
+            )
+            if _tracking_update_has_delivery_detail(mail_update):
+                return mail_update
+
         if not supports_public_tracking(carrier):
             return _tracking_error_update(
                 record,
@@ -815,6 +833,7 @@ class PackageInboxManager:
                     fetched_url=str(response.url),
                     today=dt_util.now().date(),
                 )
+                update["tracking_refresh_url"] = str(response.url)
                 if response.status >= 400:
                     update["tracking_refresh_error"] = f"http_{response.status}"
                 if carrier == "fedex" and update.get("tracking_refresh_error"):
@@ -871,6 +890,7 @@ class PackageInboxManager:
                         f"tracking_api_http_{response.status}",
                         source="public_tracking_api",
                         supported=True,
+                        refresh_url=str(response.url),
                         url=build_tracking_url(
                             record.get("carrier"),
                             record.get("tracking_code"),
@@ -888,6 +908,7 @@ class PackageInboxManager:
                         "tracking_api_not_found",
                         source="public_tracking_api",
                         supported=True,
+                        refresh_url=str(response.url),
                         url=build_tracking_url(
                             record.get("carrier"),
                             record.get("tracking_code"),
@@ -902,6 +923,7 @@ class PackageInboxManager:
                     fetched_url=str(response.url),
                     today=dt_util.now().date(),
                 )
+                update["tracking_refresh_url"] = str(response.url)
                 update["tracking_url"] = record.get("tracking_url") or update.get("tracking_url")
                 return update
         except TimeoutError:
@@ -910,6 +932,7 @@ class PackageInboxManager:
                 "tracking_api_timeout",
                 source="public_tracking_api",
                 supported=True,
+                refresh_url=url,
                 url=build_tracking_url(
                     record.get("carrier"),
                     record.get("tracking_code"),
@@ -919,6 +942,71 @@ class PackageInboxManager:
             )
         except ClientError as err:
             _LOGGER.debug("Tracking API failed for %s: %s", record.get("key"), err)
+            return None
+
+    async def _async_fetch_fedex_public_api(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        """Fetch the public FedEx web tracker JSON endpoint as a best-effort fallback."""
+        tracking_code = _clean_optional(record.get("tracking_code"))
+        if not tracking_code:
+            return None
+
+        endpoint = build_fedex_tracking_api_url()
+        session = async_get_clientsession(self.hass)
+        timeout = ClientTimeout(total=int(self.config[CONF_TRACKING_TIMEOUT]))
+        headers = {
+            "User-Agent": self.config[CONF_TRACKING_USER_AGENT],
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.7",
+            "Content-Type": "application/json",
+            "x-locale": "nl_NL",
+        }
+        try:
+            async with session.post(
+                endpoint,
+                json=build_fedex_tracking_payload(tracking_code),
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                text = await response.text(errors="replace")
+                if response.status >= 400:
+                    return _tracking_error_update(
+                        record,
+                        f"fedex_api_http_{response.status}",
+                        source="fedex_public_api",
+                        supported=True,
+                        url=build_tracking_url("fedex", tracking_code),
+                        refresh_url=str(response.url),
+                    )
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    return _tracking_error_update(
+                        record,
+                        "fedex_api_non_json",
+                        source="fedex_public_api",
+                        supported=True,
+                        url=build_tracking_url("fedex", tracking_code),
+                        refresh_url=str(response.url),
+                    )
+                update = extract_fedex_tracking_update_from_json(
+                    tracking_code=tracking_code,
+                    payload=payload,
+                    fetched_url=str(response.url),
+                    today=dt_util.now().date(),
+                )
+                update["tracking_refresh_url"] = str(response.url)
+                return update
+        except TimeoutError:
+            return _tracking_error_update(
+                record,
+                "fedex_api_timeout",
+                source="fedex_public_api",
+                supported=True,
+                url=build_tracking_url("fedex", tracking_code),
+                refresh_url=endpoint,
+            )
+        except ClientError as err:
+            _LOGGER.debug("FedEx public API failed for %s: %s", record.get("key"), err)
             return None
 
     async def _async_fetch_tracking_scraper(self, record: dict[str, Any]) -> dict[str, Any] | None:
@@ -961,13 +1049,16 @@ class PackageInboxManager:
                 except json.JSONDecodeError:
                     _LOGGER.debug("Tracking scraper returned non-JSON for %s", record.get("key"))
                     return None
-                return normalize_tracking_scraper_update(
+                update = normalize_tracking_scraper_update(
                     payload,
                     carrier=carrier,
                     tracking_code=tracking_code,
                     tracking_url=record.get("tracking_url"),
                     today=dt_util.now().date(),
                 )
+                if update:
+                    update["tracking_refresh_url"] = endpoint
+                return update
         except TimeoutError:
             _LOGGER.debug("Tracking scraper timed out for %s", record.get("key"))
             return None
@@ -987,7 +1078,7 @@ class PackageInboxManager:
                 continue
             item_code = str(_postnl_item_tracking_code(item) or "").lower()
             if tracking_code:
-                if item_code and tracking_code != item_code:
+                if not item_code or tracking_code != item_code:
                     continue
             elif record_shop:
                 item_text = clean_text(
@@ -1728,6 +1819,21 @@ def _tracking_update_has_delivery_detail(update: dict[str, Any]) -> bool:
     )
 
 
+def _tracking_diagnostic(key: str, record: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": key,
+        "carrier": record.get("carrier") or update.get("carrier") or "unknown",
+        "status": update.get("status"),
+        "source": update.get("tracking_refresh_source"),
+        "supported": update.get("tracking_refresh_supported"),
+        "error": update.get("tracking_refresh_error"),
+        "tracking_url": update.get("tracking_url") or record.get("tracking_url"),
+        "tracking_api_url": update.get("tracking_api_url"),
+        "tracking_refresh_url": update.get("tracking_refresh_url"),
+        "has_delivery_detail": _tracking_update_has_delivery_detail(update),
+    }
+
+
 def _email_exclusion_reason(fields: dict[str, str]) -> str | None:
     sender = fields.get("sender") or ""
     subject = fields.get("subject") or ""
@@ -1865,11 +1971,13 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
         "raw_excerpt": _clean_optional(record.get("raw_excerpt")),
         "tracking_url": _clean_optional(record.get("tracking_url")),
         "tracking_api_url": _clean_optional(record.get("tracking_api_url")),
+        "tracking_refresh_url": _clean_optional(record.get("tracking_refresh_url")),
         "tracking_status_text": _clean_optional(record.get("tracking_status_text")),
         "tracking_last_checked": _clean_optional(record.get("tracking_last_checked")),
         "tracking_refresh_source": _clean_optional(record.get("tracking_refresh_source")),
         "tracking_refresh_error": _clean_optional(record.get("tracking_refresh_error")),
         "tracking_refresh_supported": _bool_optional(record.get("tracking_refresh_supported")),
+        "tracking_refresh_has_delivery_detail": _bool_optional(record.get("tracking_refresh_has_delivery_detail")),
         "extra": record.get("extra") if isinstance(record.get("extra"), dict) else {},
     }
     _sanitize_delivery_window(normalized)
@@ -1926,6 +2034,10 @@ def _merge_tracking_update(
             continue
         if key == "tracking_url" and record.get("tracking_url"):
             continue
+        if key == "extra" and isinstance(value, dict):
+            previous_extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+            merged["extra"] = {**previous_extra, **value}
+            continue
         if key == "confidence" and _confidence_rank(value) < _confidence_rank(record.get("confidence")):
             continue
         if key == "status" and value == STATUS_UNKNOWN and record.get("status") != STATUS_UNKNOWN:
@@ -1933,6 +2045,7 @@ def _merge_tracking_update(
         merged[key] = value
 
     merged["tracking_last_checked"] = checked_at
+    merged["tracking_refresh_has_delivery_detail"] = _tracking_update_has_delivery_detail(update)
     if merged.get("status") in (STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"):
         merged["expected_date"] = None
         merged["delivery_window_start"] = None
@@ -1980,11 +2093,13 @@ def _tracking_error_update(
     source: str,
     supported: bool,
     url: str | None = None,
+    refresh_url: str | None = None,
 ) -> dict[str, Any]:
     return {
         "carrier": record.get("carrier") or "unknown",
         "tracking_code": record.get("tracking_code"),
         "tracking_url": url or build_tracking_url(record.get("carrier"), record.get("tracking_code")),
+        "tracking_refresh_url": refresh_url or url or build_tracking_url(record.get("carrier"), record.get("tracking_code")),
         "tracking_refresh_source": source,
         "tracking_refresh_supported": supported,
         "tracking_refresh_error": error,

@@ -166,14 +166,22 @@ def build_tracking_api_url(
     """Build a public JSON endpoint when a carrier exposes one without login."""
     carrier_slug = normalize_carrier(carrier)
     code = (tracking_code or "").strip()
+    postcode = _normalize_postcode(delivery_postcode)
     if carrier_slug == "dhl" and code:
+        key = f"{code}+{postcode}" if postcode else code
         if not code.upper().startswith("JJD"):
-            return f"https://api-gw.dhlparcel.nl/track-trace?key={quote_plus(code)}"
+            return f"https://api-gw.dhlparcel.nl/track-trace?key={quote_plus(key)}"
         return (
             "https://my.dhlecommerce.nl/receiver-parcel-api/track-trace"
-            f"?key={quote_plus(code)}&role=consumer-receiver"
+            f"?key={quote_plus(key)}&role=consumer-receiver"
         )
     return None
+
+
+def build_fedex_tracking_api_url() -> str:
+    """Return the public FedEx tracking endpoint used by the web tracker."""
+
+    return "https://www.fedex.com/track/v2/shipments"
 
 
 def supports_public_tracking(carrier: str | None) -> bool:
@@ -205,6 +213,10 @@ def normalize_tracking_scraper_update(
         "tracking_refresh_source": payload.get("tracking_refresh_source") or "local_tracking_scraper",
         "tracking_refresh_supported": True,
     }
+    if payload.get("tracking_api_url"):
+        update["tracking_api_url"] = clean_text(str(payload["tracking_api_url"]))
+    if payload.get("tracking_refresh_url"):
+        update["tracking_refresh_url"] = clean_text(str(payload["tracking_refresh_url"]))
 
     if payload.get("tracking_refresh_error"):
         update["tracking_refresh_error"] = clean_text(str(payload["tracking_refresh_error"]))
@@ -326,6 +338,7 @@ def extract_tracking_update(
         "carrier": carrier,
         "tracking_code": tracking_code,
         "tracking_url": fetched_url or build_tracking_url(carrier, tracking_code),
+        "tracking_refresh_url": fetched_url or build_tracking_url(carrier, tracking_code),
         "tracking_refresh_source": "public_tracking_page",
         "tracking_refresh_supported": True,
     }
@@ -358,6 +371,8 @@ def extract_tracking_update(
         update["pickup_location"] = pickup_location
 
     update["status"] = _extract_status(compact_text, expected_date, today)
+    if normalize_carrier(carrier) == "gls":
+        _apply_gls_tracking_text(update, compact_text, today)
     return update
 
 
@@ -396,6 +411,7 @@ def extract_tracking_update_from_json(
     }
     if fetched_url:
         update["tracking_api_url"] = fetched_url
+        update["tracking_refresh_url"] = fetched_url
 
     delivered_at = _first_nested_value(
         shipment,
@@ -443,6 +459,15 @@ def extract_tracking_update_from_json(
         dhl_status_text = _dhl_status_text(shipment)
         if dhl_status_text:
             update["tracking_status_text"] = dhl_status_text
+        events = _tracking_events_from_json(shipment)
+        if events:
+            update["extra"] = {"tracking_events": events}
+
+        problem_phase = _first_completed_phase(shipment, ("PROBLEM", "EXCEPTION", "INTERVENTION"))
+        if problem_phase:
+            update["status"] = STATUS_UNKNOWN
+            update["tracking_refresh_error"] = f"dhl_{problem_phase.lower()}"
+            return update
 
     if _json_has_completed_phase(shipment, "IN_DELIVERY") or "OUT_FOR_DELIVERY" in compact_text:
         if planned_at and planned_at.date() != today:
@@ -450,6 +475,8 @@ def extract_tracking_update_from_json(
         else:
             update["status"] = STATUS_EXPECTED_TODAY
             update.setdefault("expected_date", today.isoformat())
+    elif carrier == "dhl" and _first_completed_phase(shipment, ("UNDERWAY", "DATA_RECEIVED")):
+        update["status"] = STATUS_IN_TRANSIT
     else:
         update["status"] = _extract_status(f"{state_text} {compact_text}", update.get("expected_date"), today)
     return update
@@ -495,6 +522,7 @@ def extract_fedex_tracking_update_from_json(
         "tracking_code": tracking_code,
         "tracking_url": build_tracking_url("fedex", tracking_code),
         "tracking_api_url": fetched_url,
+        "tracking_refresh_url": fetched_url,
         "tracking_refresh_source": "fedex_public_api",
         "tracking_refresh_supported": True,
     }
@@ -550,6 +578,7 @@ def extract_fedex_tracking_update_from_mail(
         "carrier": "fedex",
         "tracking_code": tracking_code or None,
         "tracking_url": record.get("tracking_url") or build_tracking_url("fedex", tracking_code),
+        "tracking_refresh_url": record.get("tracking_url") or build_tracking_url("fedex", tracking_code),
         "tracking_refresh_source": "fedex_mail_fallback",
         "tracking_refresh_supported": True,
     }
@@ -687,6 +716,44 @@ def _latest_event(value: Any) -> Any:
     return None
 
 
+def _tracking_events_from_json(value: Any) -> list[dict[str, str]]:
+    source = _first_nested_value(value, ("events", "scanEventList", "eventHistory"))
+    if not isinstance(source, list):
+        return []
+    events: list[dict[str, str]] = []
+    for item in source[-20:]:
+        if not isinstance(item, dict):
+            continue
+        event = {
+            "timestamp": clean_text(str(_first_nested_value(item, ("time", "timestamp", "date", "dateTime")) or "")),
+            "status": clean_text(str(_first_nested_value(item, ("status", "category", "description", "remark")) or "")),
+            "location": _json_location_text(item),
+        }
+        compact = {key: value for key, value in event.items() if value}
+        if compact:
+            events.append(compact)
+    return events
+
+
+def _json_location_text(value: Any) -> str:
+    location = _first_nested_value(value, ("facility", "location", "scanLocation", "scanLocationAddress"))
+    if isinstance(location, dict):
+        parts = [
+            clean_text(str(location.get(key) or ""))
+            for key in ("city", "stateOrProvinceCode", "countryCode")
+            if location.get(key)
+        ]
+        return ", ".join(parts)
+    return clean_text(str(location or ""))
+
+
+def _first_completed_phase(value: Any, phases: tuple[str, ...]) -> str | None:
+    for phase in phases:
+        if _json_has_completed_phase(value, phase):
+            return phase
+    return None
+
+
 def _json_has_completed_phase(value: Any, phase: str) -> bool:
     phase = _phase_key(phase)
     if isinstance(value, dict):
@@ -778,6 +845,45 @@ def _datetime_from_value(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _apply_gls_tracking_text(update: dict[str, Any], compact_text: str, today: date) -> None:
+    lowered = compact_text.lower()
+    if _has_delivered_signal(lowered):
+        update["status"] = STATUS_DELIVERED
+        return
+    if any(
+        term in lowered
+        for term in (
+            "loaded onto the delivery vehicle",
+            "out for delivery",
+            "in aflevering",
+            "onderweg naar het afleveradres",
+            "wordt vandaag bezorgd",
+            "vandaag bezorgd",
+        )
+    ):
+        update["status"] = STATUS_EXPECTED_TODAY
+        update.setdefault("expected_date", today.isoformat())
+        return
+    if any(
+        term in lowered
+        for term in (
+            "parcel center",
+            "pakketcentrum",
+            "gls depot",
+            "depot",
+            "aangekondigd bij gls",
+            "pakket is ontvangen",
+            "onderweg",
+            "in transit",
+        )
+    ):
+        update["status"] = STATUS_IN_TRANSIT
+        return
+    if any(term in lowered for term in ("niet geleverd", "delivery attempt", "bezorgpoging", "exception")):
+        update["status"] = STATUS_UNKNOWN
+        update["tracking_refresh_error"] = "gls_delivery_problem"
 
 
 def _fedex_expected_date(package: dict[str, Any], today: date) -> str | None:
@@ -876,6 +982,8 @@ def _extract_status(value: str, expected_date: str | None, today: date) -> str:
     lowered = value.lower()
     if any(term in lowered for term in ("ready for pickup", "ligt klaar", "af te halen", "pickup point", "parcelshop")):
         return STATUS_READY_FOR_PICKUP
+    if _has_delivered_signal(lowered):
+        return STATUS_DELIVERED
     if any(
         term in lowered
         for term in (
@@ -888,8 +996,6 @@ def _extract_status(value: str, expected_date: str | None, today: date) -> str:
         )
     ):
         return STATUS_EXPECTED_TODAY
-    if any(term in lowered for term in ("delivered", "bezorgd", "afgeleverd")):
-        return STATUS_DELIVERED
     if expected_date == today.isoformat():
         return STATUS_EXPECTED_TODAY
     if any(
@@ -908,6 +1014,42 @@ def _extract_status(value: str, expected_date: str | None, today: date) -> str:
     ):
         return STATUS_IN_TRANSIT
     return STATUS_UNKNOWN
+
+
+def _has_delivered_signal(lowered: str) -> bool:
+    if any(
+        future in lowered
+        for future in (
+            "will be delivered",
+            "expected to be delivered",
+            "wordt bezorgd",
+            "wordt vandaag bezorgd",
+            "wordt morgen bezorgd",
+            "wordt afgeleverd",
+            "wordt vandaag afgeleverd",
+            "wordt morgen afgeleverd",
+            "zal worden bezorgd",
+        )
+    ):
+        return False
+    return any(
+        term in lowered
+        for term in (
+            "afgeleverd:",
+            "is afgeleverd",
+            "afgeleverd om",
+            "is bezorgd",
+            "bezorgd om",
+            "has been delivered",
+            "was delivered",
+            "delivered at",
+            "delivered on",
+            "delivered",
+            "bezorgd",
+            "afgeleverd",
+            "successfully delivered",
+        )
+    )
 
 
 def _extract_expected_date(value: str, today: date) -> str | None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import html
 import json
 import logging
@@ -108,8 +108,17 @@ async def auth_middleware(request: web.Request, handler):
     raise web.HTTPUnauthorized(text="missing or invalid scraper token")
 
 
-async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "parcels-fedex-scraper"})
+async def health(request: web.Request) -> web.Response:
+    settings = request.app["settings"]
+    return web.json_response(
+        {
+            "ok": True,
+            "service": "parcels-fedex-scraper",
+            "started_at": request.app.get("started_at"),
+            "headless": settings.headless,
+            "timeout": settings.timeout,
+        }
+    )
 
 
 async def track(request: web.Request) -> web.Response:
@@ -135,12 +144,23 @@ async def track(request: web.Request) -> web.Response:
         tracking_url=tracking_url,
         timeout=timeout,
     )
+    LOG.info(
+        "FedEx tracking %s -> status=%s error=%s source=%s",
+        redact_tracking_code(tracking_code),
+        result.get("status"),
+        result.get("tracking_refresh_error") or "-",
+        result.get("tracking_refresh_source") or "-",
+    )
     return web.json_response(result)
 
 
 def normalize_tracking_code(value: Any) -> str:
     code = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
     return code if 10 <= len(code) <= 40 else ""
+
+
+def redact_tracking_code(value: str) -> str:
+    return f"{value[:4]}...{value[-4:]}" if len(value) > 8 else "CODE"
 
 
 async def scrape_fedex(
@@ -186,10 +206,12 @@ async def scrape_fedex(
             update["tracking_url"] = tracking_url
             return update
         except TimeoutError:
+            LOG.info("FedEx JSON capture timed out for %s; falling back to page text", redact_tracking_code(tracking_code))
             content = await page.content()
             update = normalize_fedex_html(content, tracking_code=tracking_code, tracking_url=tracking_url)
             return update
     except PlaywrightError as err:
+        LOG.warning("FedEx Playwright error for %s: %s", redact_tracking_code(tracking_code), err)
         return error_update(tracking_code, tracking_url, f"playwright_error: {err}")
     finally:
         await context.close()
@@ -453,6 +475,7 @@ async def stop_browser(app: web.Application) -> None:
 def create_app(settings: Settings | None = None) -> web.Application:
     app = web.Application(middlewares=[auth_middleware])
     app["settings"] = settings or settings_from_env()
+    app["started_at"] = datetime.now(timezone.utc).isoformat()
     app.router.add_get("/health", health)
     app.router.add_post("/track", track)
     app.on_startup.append(start_browser)

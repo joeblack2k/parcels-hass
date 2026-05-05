@@ -14,6 +14,7 @@ sys.modules.setdefault("custom_components", custom_components)
 sys.modules.setdefault("custom_components.package_inbox", package_inbox)
 
 from custom_components.package_inbox.tracking import (
+    build_fedex_tracking_api_url,
     build_fedex_tracking_payload,
     build_tracking_api_url,
     build_tracking_url,
@@ -55,12 +56,20 @@ def test_builds_dhl_ecommerce_tracking_url_and_api_url():
         build_tracking_api_url("dhl", "JJD000090254000059755497")
         == "https://my.dhlecommerce.nl/receiver-parcel-api/track-trace?key=JJD000090254000059755497&role=consumer-receiver"
     )
+    assert (
+        build_tracking_api_url("dhl", "JJD000090254000059755497", delivery_postcode="1234 AB")
+        == "https://my.dhlecommerce.nl/receiver-parcel-api/track-trace?key=JJD000090254000059755497%2B1234AB&role=consumer-receiver"
+    )
 
 
 def test_builds_dhl_parcel_public_api_url_for_non_jjd_codes():
     assert (
         build_tracking_api_url("dhlnl", "3SBVMS6743345")
         == "https://api-gw.dhlparcel.nl/track-trace?key=3SBVMS6743345"
+    )
+    assert (
+        build_tracking_api_url("dhlnl", "3SBVMS6743345", delivery_postcode="1234 AB")
+        == "https://api-gw.dhlparcel.nl/track-trace?key=3SBVMS6743345%2B1234AB"
     )
 
 
@@ -69,6 +78,7 @@ def test_builds_fedex_tracking_url():
         build_tracking_url("fedex", "871354982751")
         == "https://www.fedex.com/fedextrack/?trknbr=871354982751"
     )
+    assert build_fedex_tracking_api_url() == "https://www.fedex.com/track/v2/shipments"
     assert build_fedex_tracking_payload("871354982751")["trackingInfo"][0]["trackNumberInfo"][
         "trackingNumber"
     ] == "871354982751"
@@ -139,6 +149,45 @@ def test_marks_fedex_permission_page_as_blocked_without_status_text():
     assert update["status"] == "unknown"
 
 
+def test_extracts_gls_public_tracking_delivered():
+    update = extract_tracking_update(
+        carrier="gls",
+        tracking_code="12345678901",
+        html="<main>GLS Netherlands: Het pakket is afgeleverd om 11:27.</main>",
+        fetched_url="https://www.gls-info.nl/Tracking?match=12345678901",
+        today=TODAY,
+    )
+
+    assert update["status"] == "delivered"
+    assert update["tracking_refresh_source"] == "public_tracking_page"
+    assert update["tracking_refresh_url"].startswith("https://www.gls-info.nl/Tracking")
+
+
+def test_extracts_gls_public_tracking_in_delivery():
+    update = extract_tracking_update(
+        carrier="gls",
+        tracking_code="12345678901",
+        html="<main>Uw GLS pakket is onderweg naar het afleveradres en wordt vandaag bezorgd tussen 10:00 en 12:00.</main>",
+        today=TODAY,
+    )
+
+    assert update["status"] == "expected_today"
+    assert update["expected_date"] == "2026-04-25"
+    assert update["delivery_window_start"] == "10:00"
+    assert update["delivery_window_end"] == "12:00"
+
+
+def test_future_delivered_text_does_not_mark_delivered():
+    update = extract_tracking_update(
+        carrier="gls",
+        tracking_code="12345678901",
+        html="<main>Your parcel will be delivered today between 10:00 and 12:00.</main>",
+        today=TODAY,
+    )
+
+    assert update["status"] == "expected_today"
+
+
 def test_extracts_dhl_delivered_from_public_json():
     update = extract_tracking_update_from_json(
         carrier="dhl",
@@ -203,6 +252,39 @@ def test_extracts_dhl_parcel_json_window_and_latest_event():
     assert update["delivery_window_start"] == "17:30"
     assert update["delivery_window_end"] == "21:30"
     assert "Den Haag" in update["tracking_status_text"]
+    assert update["extra"]["tracking_events"][-1]["location"] == "Den Haag, NL"
+
+
+def test_extracts_dhl_problem_phase_as_unknown_with_error():
+    update = extract_tracking_update_from_json(
+        carrier="dhl",
+        tracking_code="3SBVMS6743345",
+        payload={
+            "events": [
+                {
+                    "status": "ADDRESS_ISSUE",
+                    "category": "PROBLEM",
+                    "description": "Adrescontrole nodig",
+                    "facility": {"city": "Den Haag", "countryCode": "NL"},
+                }
+            ]
+        },
+        today=date(2026, 5, 5),
+    )
+
+    assert update["status"] == "unknown"
+    assert update["tracking_refresh_error"] == "dhl_problem"
+
+
+def test_extracts_dhl_data_received_as_in_transit():
+    update = extract_tracking_update_from_json(
+        carrier="dhl",
+        tracking_code="3SBVMS6743345",
+        payload={"view": {"phaseDisplay": [{"phase": "DATA_RECEIVED", "completed": True}]}},
+        today=date(2026, 5, 5),
+    )
+
+    assert update["status"] == "in_transit"
 
 
 def test_extracts_fedex_json_status_location_and_window():
