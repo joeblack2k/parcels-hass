@@ -1,0 +1,769 @@
+"""Best-effort public track-and-trace enrichment.
+
+Carrier pages change often and some require postcode/account checks. This module
+only extracts obvious information from public HTML/embedded JSON and reports a
+soft error when a page cannot be interpreted.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+import json
+import re
+from typing import Any
+from urllib.parse import quote_plus
+
+from .carrier_rules import normalize_carrier
+from .const import (
+    STATUS_DELIVERED,
+    STATUS_EXPECTED_TODAY,
+    STATUS_IN_TRANSIT,
+    STATUS_READY_FOR_PICKUP,
+    STATUS_UNKNOWN,
+)
+from .parser import clean_text
+
+
+PUBLIC_TRACKING_CARRIERS = {"postnl", "dhl", "dpd", "gls", "fedex", "chronopost"}
+
+TRACKING_URLS = {
+    "postnl": "https://www.postnl.nl/tracktrace/?B={code}",
+    "dhl": "https://www.dhl.com/nl-nl/home/tracking.html?tracking-id={code}",
+    "dpd": "https://www.dpd.com/nl/nl/ontvangen/volgen/?parcelNumber={code}",
+    "gls": "https://www.gls-info.nl/Tracking?match={code}",
+    "fedex": "https://www.fedex.com/fedextrack/?trknbr={code}",
+    "chronopost": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT={code}",
+}
+
+BLOCKED_HINTS = (
+    "captcha",
+    "robot",
+    "bot detection",
+    "access denied",
+    "access-denied",
+    "toegang geweigerd",
+    "permission to view this webpage",
+    "don't have permission",
+    "do not have permission",
+    "can't process your request",
+    "cannot process your request",
+    "unable to process your request",
+    "system down",
+    "system-error",
+    "page not found",
+    "currently not available",
+    "errors.edgesuite.net",
+)
+
+HUMAN_REQUIRED_HINTS = (
+    "postcode",
+    "zip code",
+    "postal code",
+    "log in",
+    "login",
+    "sign in",
+)
+
+TRACKING_BLOCKED_ERROR = "tracking_page_blocked_or_permission"
+
+def build_tracking_url(carrier: str | None, tracking_code: str | None) -> str | None:
+    """Build the public tracking URL for a carrier/code pair."""
+    carrier_slug = normalize_carrier(carrier)
+    code = (tracking_code or "").strip()
+    if carrier_slug == "dhl" and code.upper().startswith("JJD"):
+        return f"https://my.dhlecommerce.nl/go-track-trace?role=consumer-receiver&tc={quote_plus(code)}"
+    template = TRACKING_URLS.get(carrier_slug)
+    if not template or not code:
+        return None
+    return template.format(code=quote_plus(code))
+
+
+def build_tracking_api_url(carrier: str | None, tracking_code: str | None) -> str | None:
+    """Build a public JSON endpoint when a carrier exposes one without login."""
+    carrier_slug = normalize_carrier(carrier)
+    code = (tracking_code or "").strip()
+    if carrier_slug == "dhl" and code:
+        if not code.upper().startswith("JJD"):
+            return f"https://api-gw.dhlparcel.nl/track-trace?key={quote_plus(code)}"
+        return (
+            "https://my.dhlecommerce.nl/receiver-parcel-api/track-trace"
+            f"?key={quote_plus(code)}&role=consumer-receiver"
+        )
+    return None
+
+
+def supports_public_tracking(carrier: str | None) -> bool:
+    """Return whether this carrier has a public page adapter."""
+    return normalize_carrier(carrier) in PUBLIC_TRACKING_CARRIERS
+
+
+def extract_tracking_update(
+    *,
+    carrier: str,
+    tracking_code: str,
+    html: str,
+    fetched_url: str | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Extract normalized tracking fields from a carrier tracking page."""
+    today = today or date.today()
+    text = _page_to_text(html)
+    compact_text = re.sub(r"\s+", " ", text).strip()
+    lowered = compact_text.lower()
+
+    update: dict[str, Any] = {
+        "carrier": carrier,
+        "tracking_code": tracking_code,
+        "tracking_url": fetched_url or build_tracking_url(carrier, tracking_code),
+        "tracking_refresh_source": "public_tracking_page",
+        "tracking_refresh_supported": True,
+    }
+
+    if is_blocked_tracking_text(compact_text):
+        update["tracking_refresh_error"] = TRACKING_BLOCKED_ERROR
+        update["tracking_status_text"] = ""
+        update["status"] = STATUS_UNKNOWN
+        return update
+
+    if _needs_human_or_postcode(compact_text):
+        update["tracking_refresh_error"] = "tracking_page_needs_human_or_postcode"
+        update["tracking_status_text"] = ""
+        update["status"] = STATUS_UNKNOWN
+        return update
+
+    update["tracking_status_text"] = _status_excerpt(compact_text, carrier)
+
+    expected_date = _extract_expected_date(compact_text, today)
+    if expected_date:
+        update["expected_date"] = expected_date
+
+    start, end = _extract_time_window(compact_text)
+    if start and end:
+        update["delivery_window_start"] = start
+        update["delivery_window_end"] = end
+
+    pickup_location = _extract_pickup_location(compact_text)
+    if pickup_location:
+        update["pickup_location"] = pickup_location
+
+    update["status"] = _extract_status(compact_text, expected_date, today)
+    return update
+
+
+def is_blocked_tracking_text(value: str | None) -> bool:
+    """Return true when a carrier response is an error, auth or bot page."""
+    lowered = clean_text(value).lower()
+    return any(hint in lowered for hint in BLOCKED_HINTS)
+
+
+def _needs_human_or_postcode(value: str | None) -> bool:
+    lowered = clean_text(value).lower()
+    return any(hint in lowered for hint in HUMAN_REQUIRED_HINTS)
+
+
+def extract_tracking_update_from_json(
+    *,
+    carrier: str,
+    tracking_code: str,
+    payload: Any,
+    fetched_url: str | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Extract normalized tracking fields from a public carrier JSON response."""
+    today = today or date.today()
+    shipment = _first_shipment(payload)
+    flattened = _flatten_json(shipment if shipment is not None else payload)
+    compact_text = re.sub(r"\s+", " ", flattened).strip()
+
+    update: dict[str, Any] = {
+        "carrier": carrier,
+        "tracking_code": tracking_code,
+        "tracking_url": build_tracking_url(carrier, tracking_code),
+        "tracking_refresh_source": "public_tracking_api",
+        "tracking_refresh_supported": True,
+        "tracking_status_text": _status_excerpt(compact_text, carrier),
+    }
+    if fetched_url:
+        update["tracking_api_url"] = fetched_url
+
+    delivered_at = _first_nested_value(
+        shipment,
+        ("deliveredAt", "delivered_at", "deliveryDate", "delivery_date"),
+    )
+    delivery_moment = _first_nested_value(
+        shipment,
+        (
+            "momentIndication",
+            "moment",
+            "expectedDeliveryDate",
+            "plannedDate",
+            "planned_date",
+            "deliveryDate",
+            "expectedDeliveryMoment",
+        ),
+    )
+    state_text = str(
+        _first_nested_value(shipment, ("stateMessage", "message", "status", "statusMessage"))
+        or ""
+    )
+
+    if delivered_at or _json_has_completed_phase(shipment, "DELIVERED"):
+        update["status"] = STATUS_DELIVERED
+        delivered_when = _datetime_from_value(delivered_at or delivery_moment)
+        if delivered_when:
+            update["tracking_status_text"] = f"Delivered at {delivered_when.strftime('%Y-%m-%d %H:%M')}"
+        return update
+
+    planned_at = _datetime_from_value(delivery_moment)
+    window_start_at, _window_end_at = _datetime_window_from_json(shipment)
+    if not planned_at and window_start_at:
+        planned_at = window_start_at
+    if planned_at:
+        update["expected_date"] = planned_at.date().isoformat()
+
+    start, end = _extract_window_from_json(shipment)
+    if not start or not end:
+        start, end = _extract_time_window(compact_text)
+    if start and end:
+        update["delivery_window_start"] = start
+        update["delivery_window_end"] = end
+
+    if carrier == "dhl":
+        dhl_status_text = _dhl_status_text(shipment)
+        if dhl_status_text:
+            update["tracking_status_text"] = dhl_status_text
+
+    if _json_has_completed_phase(shipment, "IN_DELIVERY") or "OUT_FOR_DELIVERY" in compact_text:
+        if planned_at and planned_at.date() != today:
+            update["status"] = STATUS_IN_TRANSIT
+        else:
+            update["status"] = STATUS_EXPECTED_TODAY
+            update.setdefault("expected_date", today.isoformat())
+    else:
+        update["status"] = _extract_status(f"{state_text} {compact_text}", update.get("expected_date"), today)
+    return update
+
+
+def build_fedex_tracking_payload(tracking_code: str) -> dict[str, Any]:
+    """Build the public FedEx WTRK tracking payload."""
+    return {
+        "appDeviceType": "WTRK",
+        "appType": "WTRK",
+        "summaryView": False,
+        "supportHTML": True,
+        "supportCurrentLocation": True,
+        "trackingInfo": [
+            {
+                "trackNumberInfo": {
+                    "trackingCarrier": "",
+                    "trackingNumber": tracking_code,
+                    "trackingQualifier": "",
+                }
+            }
+        ],
+        "uniqueKey": "",
+        "guestAuthenticationToken": "",
+    }
+
+
+def extract_fedex_tracking_update_from_json(
+    *,
+    tracking_code: str,
+    payload: Any,
+    fetched_url: str | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Extract normalized fields from FedEx WTRK JSON."""
+    today = today or date.today()
+    package = _first_fedex_package(payload)
+    flattened = _flatten_json(package if package is not None else payload)
+    compact_text = re.sub(r"\s+", " ", flattened).strip()
+
+    update: dict[str, Any] = {
+        "carrier": "fedex",
+        "tracking_code": tracking_code,
+        "tracking_url": build_tracking_url("fedex", tracking_code),
+        "tracking_api_url": fetched_url,
+        "tracking_refresh_source": "fedex_public_api",
+        "tracking_refresh_supported": True,
+    }
+
+    if not isinstance(package, dict):
+        update["tracking_refresh_error"] = "fedex_api_no_package"
+        update["tracking_status_text"] = ""
+        update["status"] = STATUS_UNKNOWN
+        return update
+
+    if package.get("trackingNbr"):
+        update["tracking_code"] = str(package["trackingNbr"])
+
+    delivered = package.get("delivered") is True or str(package.get("keyStatusCD") or "").upper() == "DL"
+    expected_date = _fedex_expected_date(package, today)
+    if expected_date:
+        update["expected_date"] = expected_date
+
+    start, end = _fedex_time_window(package)
+    if start and end:
+        update["delivery_window_start"] = start
+        update["delivery_window_end"] = end
+
+    location = _fedex_location(package)
+    status_text = _fedex_status_text(package, location)
+    if status_text and not is_blocked_tracking_text(status_text):
+        update["tracking_status_text"] = status_text
+
+    if delivered:
+        update["status"] = STATUS_DELIVERED
+    elif package.get("deliveryToday") is True or expected_date == today.isoformat():
+        update["status"] = STATUS_EXPECTED_TODAY
+        update.setdefault("expected_date", today.isoformat())
+    else:
+        update["status"] = _extract_status(f"{compact_text} {status_text or ''}", expected_date, today)
+
+    return update
+
+
+def extract_fedex_tracking_update_from_mail(
+    *,
+    record: dict[str, Any],
+    error: str | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Build a FedEx update from the latest mail when live tracking is blocked."""
+    today = today or date.today()
+    tracking_code = str(record.get("tracking_code") or "").strip()
+    raw_excerpt = clean_text(str(record.get("raw_excerpt") or ""))
+    expected_date = str(record.get("expected_date") or "") or _extract_expected_date(raw_excerpt, today)
+
+    update: dict[str, Any] = {
+        "carrier": "fedex",
+        "tracking_code": tracking_code or None,
+        "tracking_url": record.get("tracking_url") or build_tracking_url("fedex", tracking_code),
+        "tracking_refresh_source": "fedex_mail_fallback",
+        "tracking_refresh_supported": True,
+    }
+
+    if expected_date:
+        update["expected_date"] = expected_date
+
+    start = record.get("delivery_window_start")
+    end = record.get("delivery_window_end")
+    if start and end and start != end:
+        update["delivery_window_start"] = start
+        update["delivery_window_end"] = end
+
+    status_text = _fedex_mail_status_text(raw_excerpt, expected_date)
+    if status_text:
+        update["tracking_status_text"] = status_text
+
+    status = str(record.get("status") or "")
+    if status and status != STATUS_UNKNOWN:
+        update["status"] = status
+    else:
+        update["status"] = _extract_status(raw_excerpt, expected_date, today)
+
+    if not (expected_date or status_text or update["status"] != STATUS_UNKNOWN):
+        update["tracking_refresh_error"] = error or TRACKING_BLOCKED_ERROR
+    return update
+
+
+def _page_to_text(html: str) -> str:
+    parts: list[str] = []
+    parts.extend(_json_script_text(html))
+    parts.append(html)
+    return clean_text("\n".join(parts))
+
+
+def _json_script_text(html: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(
+        r"(?is)<script[^>]+(?:application/(?:ld\+)?json|__NEXT_DATA__)[^>]*>(.*?)</script>",
+        html,
+    ):
+        raw = clean_text(match.group(1))
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            values.append(raw)
+            continue
+        values.append(_flatten_json(parsed))
+    return values
+
+
+def _flatten_json(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(_flatten_json(child) for child in value.values())
+    if isinstance(value, list):
+        return " ".join(_flatten_json(child) for child in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _first_shipment(payload: Any) -> Any:
+    if isinstance(payload, list):
+        return payload[0] if payload else None
+    return payload
+
+
+def _first_fedex_package(payload: Any) -> Any:
+    packages = _first_nested_value(payload, ("packages",))
+    if isinstance(packages, list) and packages:
+        return packages[0]
+    if isinstance(payload, dict) and _looks_like_fedex_package(payload):
+        return payload
+    return None
+
+
+def _looks_like_fedex_package(value: Any) -> bool:
+    return isinstance(value, dict) and any(key in value for key in ("trackingNbr", "keyStatus", "mainStatus"))
+
+
+def _first_nested_value(value: Any, keys: tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        for key in keys:
+            if key in value and value[key]:
+                return value[key]
+        for child in value.values():
+            found = _first_nested_value(child, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_nested_value(item, keys)
+            if found:
+                return found
+    return None
+
+
+def _dhl_status_text(payload: Any) -> str | None:
+    event = _latest_event(payload)
+    if not isinstance(event, dict):
+        return None
+    parts = [
+        clean_text(str(event.get(key) or ""))
+        for key in ("status", "category", "description", "remark")
+        if event.get(key)
+    ]
+    facility = event.get("facility")
+    if isinstance(facility, dict):
+        parts.extend(
+            clean_text(str(facility.get(key) or ""))
+            for key in ("city", "countryCode")
+            if facility.get(key)
+        )
+    location = event.get("location")
+    if isinstance(location, dict):
+        parts.extend(
+            clean_text(str(location.get(key) or ""))
+            for key in ("city", "countryCode")
+            if location.get(key)
+        )
+    seen: set[str] = set()
+    unique = [part for part in parts if part and not (part in seen or seen.add(part))]
+    return " - ".join(unique)[:220] if unique else None
+
+
+def _latest_event(value: Any) -> Any:
+    events = _first_nested_value(value, ("events", "scanEventList", "eventHistory"))
+    if isinstance(events, list) and events:
+        return events[-1]
+    return None
+
+
+def _json_has_completed_phase(value: Any, phase: str) -> bool:
+    phase = _phase_key(phase)
+    if isinstance(value, dict):
+        current_phase = _phase_key(value.get("phase"))
+        event_key = _phase_key(value.get("key"))
+        status = _phase_key(value.get("status"))
+        category = _phase_key(value.get("category"))
+        completed = value.get("completed")
+        if current_phase == phase and (completed is not False):
+            return True
+        if event_key == phase or status == phase or category == phase:
+            return True
+        return any(_json_has_completed_phase(child, phase) for child in value.values())
+    if isinstance(value, list):
+        return any(_json_has_completed_phase(item, phase) for item in value)
+    return False
+
+
+def _phase_key(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", str(value or "").upper()).strip("_")
+
+
+def _extract_window_from_json(value: Any) -> tuple[str | None, str | None]:
+    if isinstance(value, dict):
+        for interval_key in ("plannedDeliveryTimeframe", "expectedDeliveryTimeframe", "deliveryTimeframe"):
+            start_at, end_at = _datetime_window_from_value(value.get(interval_key))
+            if start_at and end_at:
+                return (start_at.strftime("%H:%M"), end_at.strftime("%H:%M"))
+
+        candidates = (
+            ("deliveryWindowStart", "deliveryWindowEnd"),
+            ("delivery_window_start", "delivery_window_end"),
+            ("expectedFrom", "expectedTo"),
+            ("plannedFrom", "plannedTo"),
+            ("planned_from", "planned_to"),
+            ("from", "to"),
+            ("start", "end"),
+        )
+        for start_key, end_key in candidates:
+            if value.get(start_key) and value.get(end_key):
+                start = _time_from_any(value[start_key])
+                end = _time_from_any(value[end_key])
+                if start and end:
+                    return (start, end)
+        for child in value.values():
+            start, end = _extract_window_from_json(child)
+            if start and end:
+                return (start, end)
+    elif isinstance(value, list):
+        for item in value:
+            start, end = _extract_window_from_json(item)
+            if start and end:
+                return (start, end)
+    return (None, None)
+
+
+def _datetime_window_from_json(value: Any) -> tuple[datetime | None, datetime | None]:
+    if isinstance(value, dict):
+        for interval_key in ("plannedDeliveryTimeframe", "expectedDeliveryTimeframe", "deliveryTimeframe"):
+            start_at, end_at = _datetime_window_from_value(value.get(interval_key))
+            if start_at and end_at:
+                return (start_at, end_at)
+        for child in value.values():
+            start_at, end_at = _datetime_window_from_json(child)
+            if start_at and end_at:
+                return (start_at, end_at)
+    elif isinstance(value, list):
+        for item in value:
+            start_at, end_at = _datetime_window_from_json(item)
+            if start_at and end_at:
+                return (start_at, end_at)
+    return (None, None)
+
+
+def _datetime_window_from_value(value: Any) -> tuple[datetime | None, datetime | None]:
+    if not value:
+        return (None, None)
+    parts = str(value).split("/", 1)
+    if len(parts) != 2:
+        return (None, None)
+    return (_datetime_from_value(parts[0]), _datetime_from_value(parts[1]))
+
+
+def _datetime_from_value(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _fedex_expected_date(package: dict[str, Any], today: date) -> str | None:
+    for key in ("estDeliveryDt", "actDeliveryDt", "displayEstDeliveryDt", "displayActDeliveryDt"):
+        value = package.get(key)
+        parsed = _datetime_from_value(value)
+        if parsed:
+            return parsed.date().isoformat()
+        extracted = _extract_expected_date(str(value or ""), today)
+        if extracted:
+            return extracted
+    return None
+
+
+def _fedex_time_window(package: dict[str, Any]) -> tuple[str | None, str | None]:
+    window = package.get("estDelTimeWindow")
+    if isinstance(window, dict):
+        for start_key, end_key in (
+            ("displayEstDelTmWindowTmStart", "displayEstDelTmWindowTmEnd"),
+            ("estDelTmWindowTmStart", "estDelTmWindowTmEnd"),
+            ("startTime", "endTime"),
+        ):
+            start = _time_from_any(window.get(start_key))
+            end = _time_from_any(window.get(end_key))
+            if start and end:
+                return (start, end)
+    return _extract_time_window(
+        " ".join(
+            str(package.get(key) or "")
+            for key in ("displayEstDeliveryTm", "displayEstDeliveryDateTime", "statusWithDetails")
+        )
+    )
+
+
+def _fedex_location(package: dict[str, Any]) -> str | None:
+    for source in (
+        package.get("statusLocationAddress"),
+        _first_nested_value(package.get("scanEventList"), ("scanLocation",)),
+    ):
+        if not isinstance(source, dict):
+            continue
+        parts = [
+            clean_text(str(source.get(key) or ""))
+            for key in ("city", "stateOrProvinceCode", "countryCode")
+            if source.get(key)
+        ]
+        if parts:
+            return ", ".join(parts)
+    return None
+
+
+def _fedex_status_text(package: dict[str, Any], location: str | None) -> str | None:
+    parts = [
+        clean_text(str(package.get(key) or ""))
+        for key in ("mainStatus", "keyStatus", "statusWithDetails", "subStatus")
+        if package.get(key)
+    ]
+    if location:
+        parts.append(location)
+    seen: set[str] = set()
+    unique = [part for part in parts if part and not (part in seen or seen.add(part))]
+    return " - ".join(unique)[:220] if unique else None
+
+
+def _fedex_mail_status_text(raw_excerpt: str, expected_date: str | None) -> str | None:
+    if not raw_excerpt:
+        return None
+    parts: list[str] = []
+    sender = re.search(r"(?i)uw zending van\s+(.+?)\s+is onderweg", raw_excerpt)
+    if sender:
+        parts.append(clean_text(sender.group(1)))
+    if expected_date:
+        parts.append(f"gepland {expected_date}")
+    service = re.search(r"(?i)\bservice\s+(.+?)(?:\s+tracking|\s+aantal|\s+totaal|$)", raw_excerpt)
+    if service:
+        parts.append(clean_text(service.group(1)))
+    seen: set[str] = set()
+    unique = [part for part in parts if part and not (part in seen or seen.add(part))]
+    return "FedEx mail: " + " - ".join(unique)[:200] if unique else None
+
+
+def _time_from_any(value: Any) -> str | None:
+    parsed = _datetime_from_value(value)
+    if parsed:
+        return parsed.strftime("%H:%M")
+    match = re.search(r"\b([0-2]?\d)[:.h]([0-5]\d)\b", str(value))
+    if match:
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+    return None
+
+
+def _extract_status(value: str, expected_date: str | None, today: date) -> str:
+    lowered = value.lower()
+    if any(term in lowered for term in ("ready for pickup", "ligt klaar", "af te halen", "pickup point", "parcelshop")):
+        return STATUS_READY_FOR_PICKUP
+    if any(
+        term in lowered
+        for term in (
+            "out for delivery",
+            "in delivery",
+            "wordt vandaag bezorgd",
+            "vandaag verwacht",
+            "expected today",
+            "will be delivered",
+        )
+    ):
+        return STATUS_EXPECTED_TODAY
+    if any(term in lowered for term in ("delivered", "bezorgd", "afgeleverd")):
+        return STATUS_DELIVERED
+    if expected_date == today.isoformat():
+        return STATUS_EXPECTED_TODAY
+    if any(
+        term in lowered
+        for term in (
+            "in transit",
+            "underway",
+            "onderweg",
+            "sortering",
+            "sorting",
+            "shipment",
+            "zending",
+            "data received",
+            "parcel sorted",
+        )
+    ):
+        return STATUS_IN_TRANSIT
+    return STATUS_UNKNOWN
+
+
+def _extract_expected_date(value: str, today: date) -> str | None:
+    lowered = value.lower()
+    if re.search(r"\b(vandaag|today)\b", lowered):
+        return today.isoformat()
+    if re.search(r"\b(morgen|tomorrow)\b", lowered):
+        return (today + timedelta(days=1)).isoformat()
+
+    for pattern in (
+        r"\b(20\d{2})-(\d{2})-(\d{2})(?:[tT ][0-2]\d:[0-5]\d(?::[0-5]\d)?)?",
+        r"\b(\d{1,2})[-/](\d{1,2})(?:[-/](20\d{2}|\d{2}))?\b",
+    ):
+        match = re.search(pattern, value)
+        if not match:
+            continue
+        try:
+            if pattern.startswith("\\b(20"):
+                return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+            year = int(match.group(3) or today.year)
+            if year < 100:
+                year += 2000
+            return date(year, int(match.group(2)), int(match.group(1))).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_time_window(value: str) -> tuple[str | None, str | None]:
+    match = re.search(
+        r"(?i)(?:tussen|between|van|from)?\s*([0-2]?\d)[:.h]([0-5]\d)\s*(?:en|and|-|tot|to|until)\s*([0-2]?\d)[:.h]([0-5]\d)",
+        value,
+    )
+    if match:
+        return (
+            f"{int(match.group(1)):02d}:{match.group(2)}",
+            f"{int(match.group(3)):02d}:{match.group(4)}",
+        )
+
+    iso_times = []
+    for match in re.finditer(r"\b20\d{2}-\d{2}-\d{2}[tT ]([0-2]\d):([0-5]\d)", value):
+        iso_times.append(f"{match.group(1)}:{match.group(2)}")
+    if len(iso_times) >= 2:
+        return (iso_times[0], iso_times[1])
+    return (None, None)
+
+
+def _extract_pickup_location(value: str) -> str | None:
+    match = re.search(
+        r"(?i)\b(?:bij|at|pickup point|parcelshop|servicepoint)\s+(?:de\s+)?([A-Z][A-Za-z0-9 &'.-]{2,70})(?:[,.]|$)",
+        value,
+    )
+    if match:
+        return match.group(1).strip(" .,-")[:70]
+    return None
+
+
+def _status_excerpt(value: str, carrier: str) -> str | None:
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", value)
+    carrier_lower = carrier.lower()
+    keywords = (
+        carrier_lower,
+        "bezorgd",
+        "delivered",
+        "onderweg",
+        "in transit",
+        "verwacht",
+        "expected",
+        "vandaag",
+        "today",
+        "pickup",
+        "afhalen",
+    )
+    for sentence in sentences:
+        cleaned = sentence.strip()
+        if 12 <= len(cleaned) <= 220 and any(keyword in cleaned.lower() for keyword in keywords):
+            return cleaned[:220]
+    return value[:220] if value else None

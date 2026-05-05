@@ -1,0 +1,28 @@
+.DS_Store
+.idea/
+.vscode/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Home Assistant runtime data. Never publish a live config directory.
+.storage/
+*.db
+*.db-*
+home-assistant.log*
+secrets.yaml
+known_devices.yaml
+tts/
+www/package_inbox/
+
+# Local diagnostics and exports.
+*.log
+*.jsonl
+diagnostics/
+exports/

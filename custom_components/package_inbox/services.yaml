@@ -1,0 +1,177 @@
+process_imap_event:
+  name: Process IMAP event
+  description: Process an imap_content event into Parcels.
+  fields:
+    entry_id:
+      name: IMAP entry ID
+      required: true
+      selector:
+        text:
+    uid:
+      name: IMAP UID
+      required: true
+      selector:
+        text:
+    subject:
+      name: Subject
+      required: false
+      selector:
+        text:
+    sender:
+      name: Sender
+      required: false
+      selector:
+        text:
+    text:
+      name: Event text
+      required: false
+      selector:
+        text:
+          multiline: true
+    headers:
+      name: Headers
+      required: false
+      selector:
+        object:
+    notify:
+      name: Send notifications
+      required: false
+      default: true
+      selector:
+        boolean:
+    mark_seen:
+      name: Mark mail seen after processing
+      required: false
+      default: true
+      selector:
+        boolean:
+
+send_morning_summary:
+  name: Send morning summary
+  description: Send today's package summary to Matrix when packages are due today.
+  fields:
+    notify:
+      name: Send notification
+      required: false
+      default: true
+      selector:
+        boolean:
+
+send_pickup_summary:
+  name: Send pickup summary
+  description: Send all outstanding pickup packages to Matrix.
+  fields:
+    notify:
+      name: Send notification
+      required: false
+      default: true
+      selector:
+        boolean:
+
+refresh_tracking:
+  name: Refresh tracking
+  description: Refresh stored packages with PostNL/Vinted integrations and public DHL/DPD/GLS/FedEx/Chronopost tracking pages.
+  fields:
+    notify:
+      name: Send notifications
+      required: false
+      default: true
+      selector:
+        boolean:
+    force:
+      name: Force refresh
+      required: false
+      default: false
+      selector:
+        boolean:
+    package_key:
+      name: Package key
+      required: false
+      selector:
+        text:
+
+debug_parse:
+  name: Debug parse
+  description: Parse sample mail text without storing it.
+  fields:
+    subject:
+      name: Subject
+      required: false
+      selector:
+        text:
+    sender:
+      name: Sender
+      required: false
+      selector:
+        text:
+    text:
+      name: Mail text
+      required: true
+      selector:
+        text:
+          multiline: true
+
+add_package:
+  name: Add package
+  description: Add or update one normalized package record manually.
+  fields:
+    package:
+      name: Package
+      required: true
+      selector:
+        object:
+    notify:
+      name: Send notifications
+      required: false
+      default: true
+      selector:
+        boolean:
+
+mark_picked_up:
+  name: Mark picked up
+  description: Mark one stored package as picked up so it disappears from pickup summaries.
+  fields:
+    package_key:
+      name: Package key
+      required: true
+      selector:
+        text:
+
+set_status:
+  name: Set package status
+  description: Set one stored package status from the dashboard.
+  fields:
+    package_key:
+      name: Package key
+      required: true
+      selector:
+        text:
+    status:
+      name: Status
+      required: true
+      selector:
+        select:
+          options:
+            - expected_today
+            - in_transit
+            - ready_for_pickup
+            - delivered
+            - picked_up
+            - cancelled
+            - unknown
+    notify:
+      name: Send notifications
+      required: false
+      default: false
+      selector:
+        boolean:
+
+delete_package:
+  name: Delete package
+  description: Permanently delete one package record from Parcels storage.
+  fields:
+    package_key:
+      name: Package key
+      required: true
+      selector:
+        text:
