@@ -64,7 +64,9 @@ Do not put personal receiver details in public bug reports or shared test fixtur
 
 For personal setups where FedEx blocks server-side tracking requests, Parcels can optionally call a local scraper sidecar before falling back to IMAP/public tracking. This is disabled by default and not required for HACS use.
 
-See [docs/fedex-scraper.md](docs/fedex-scraper.md) and [experimental/fedex-scraper](experimental/fedex-scraper).
+On Home Assistant OS, use the Supervisor-managed add-on at [addons/parcels_fedex_scraper](addons/parcels_fedex_scraper). For non-HAOS development, the same service is available as a standalone Docker Compose sidecar in [experimental/fedex-scraper](experimental/fedex-scraper).
+
+See [docs/fedex-scraper.md](docs/fedex-scraper.md).
 
 ## Services
 

@@ -21,7 +21,29 @@ normalized status only: delivered / expected_today / in_transit / unknown
 
 The sidecar does not send FedEx cookies, raw HTML, browser storage, or account tokens back to Home Assistant.
 
-## Run the Sidecar
+## Home Assistant OS Add-on
+
+On Home Assistant OS, use the Supervisor-managed app/add-on instead of a loose Docker Compose service.
+
+The add-on lives in this repository at:
+
+```text
+addons/parcels_fedex_scraper
+```
+
+For a local HAOS install, copy that folder into the Home Assistant `addons` share as `parcels_fedex_scraper`, reload the add-on store, install **Parcels FedEx Scraper**, and start it. The app exposes an internal HTTP API on port `8765`.
+
+Local add-on URL for the integration:
+
+```yaml
+package_inbox:
+  tracking_scraper_url: "http://local-parcels-fedex-scraper:8765"
+  tracking_scraper_token: !secret parcels_tracking_scraper_token
+```
+
+The token is optional while the add-on is only reachable over the Supervisor internal network. If you expose port `8765` in the add-on network settings, set `scraper_token` in the add-on options and the same value in `tracking_scraper_token`.
+
+## Standalone Docker Sidecar
 
 From this repository:
 

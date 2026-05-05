@@ -1,0 +1,23 @@
+name: Parcels FedEx Scraper
+version: "0.1.0"
+slug: parcels_fedex_scraper
+description: Experimental local FedEx tracking scraper for Parcels for Home Assistant.
+url: https://github.com/joeblack2k/parcels-hass/tree/main/addons/parcels_fedex_scraper
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false
+stage: experimental
+ports:
+  8765/tcp: null
+ports_description:
+  8765/tcp: Optional HTTP API for the parcels-hass tracking scraper bridge.
+watchdog: http://[HOST]:[PORT:8765]/health
+options:
+  headless: true
+  timeout: 45
+schema:
+  scraper_token: password?
+  headless: bool
+  timeout: int(10,90)
