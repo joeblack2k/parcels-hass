@@ -21,6 +21,7 @@ from custom_components.package_inbox.tracking import (
     extract_fedex_tracking_update_from_json,
     extract_tracking_update,
     extract_tracking_update_from_json,
+    normalize_tracking_scraper_update,
 )
 
 
@@ -286,3 +287,52 @@ def test_fedex_mail_fallback_delivered_mail_overrides_previous_transit_status():
 
     assert update["status"] == "delivered"
     assert update["tracking_status_text"] == "FedEx mail: Ubiquiti International Holding B.V. - FedEx Priority"
+
+
+def test_normalizes_local_tracking_scraper_delivered_response():
+    update = normalize_tracking_scraper_update(
+        {
+            "carrier": "fedex",
+            "tracking_code": "871354982751",
+            "status": "delivered",
+            "raw_status": "Delivered",
+            "tracking_status_text": "Delivered - Left at front door",
+            "location": "LEIDSCHENDAM, NL",
+            "expected_date": "2026-05-05",
+            "events": [{"status": "Delivered", "location": "LEIDSCHENDAM, NL"}],
+        },
+        carrier="fedex",
+        tracking_code="871354982751",
+        tracking_url="https://www.fedex.com/fedextrack/?trknbr=871354982751",
+        today=date(2026, 5, 5),
+    )
+
+    assert update is not None
+    assert update["status"] == "delivered"
+    assert update["tracking_refresh_source"] == "local_tracking_scraper"
+    assert update["tracking_refresh_supported"] is True
+    assert update["tracking_url"].startswith("https://www.fedex.com/fedextrack")
+    assert update["expected_date"] == "2026-05-05"
+    assert "LEIDSCHENDAM" in update["tracking_status_text"]
+    assert update["extra"]["tracking_events"][0]["status"] == "Delivered"
+
+
+def test_normalizes_local_tracking_scraper_out_for_delivery_response():
+    update = normalize_tracking_scraper_update(
+        {
+            "carrier": "fedex",
+            "tracking_code": "871354982751",
+            "status": "out_for_delivery",
+            "raw_status": "On FedEx vehicle for delivery",
+            "delivery_window_start": "12:10",
+            "delivery_window_end": "14:10",
+        },
+        carrier="fedex",
+        tracking_code="871354982751",
+        today=date(2026, 5, 5),
+    )
+
+    assert update is not None
+    assert update["status"] == "expected_today"
+    assert update["delivery_window_start"] == "12:10"
+    assert update["delivery_window_end"] == "14:10"

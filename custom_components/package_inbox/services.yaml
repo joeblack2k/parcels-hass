@@ -70,7 +70,7 @@ send_pickup_summary:
 
 refresh_tracking:
   name: Refresh tracking
-  description: Refresh stored packages with PostNL/Vinted integrations and public DHL/DPD/GLS/FedEx/Chronopost tracking pages.
+  description: Refresh stored packages with PostNL/Vinted integrations, optional local scraper sidecars, and public DHL/DPD/GLS/FedEx/Chronopost tracking pages.
   fields:
     notify:
       name: Send notifications

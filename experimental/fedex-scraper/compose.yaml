@@ -1,0 +1,14 @@
+services:
+  fedex-scraper:
+    build: .
+    container_name: parcels-fedex-scraper
+    ports:
+      - "8765:8765"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8765"
+      FEDEX_SCRAPER_HEADLESS: "true"
+      FEDEX_SCRAPER_TIMEOUT: "45"
+      # Set this and mirror it in Home Assistant as tracking_scraper_token.
+      # SCRAPER_TOKEN: "change-me"
+    restart: unless-stopped

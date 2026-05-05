@@ -16,6 +16,7 @@ Before pushing:
 - Do not copy a live Home Assistant config directory.
 - Do not commit `.storage`, databases, logs, diagnostics, secrets, Matrix room IDs, IMAP entry IDs, tokens, dashboard config, or personal defaults.
 - Keep Amazon cookie bridge work out of the public HACS default flow.
+- Keep carrier scraper sidecars optional and disabled by default; do not commit personal tracking numbers, cookies, browser profiles, or raw carrier responses.
 - Prefer parser fixtures and normalized records over raw personal mail examples.
 
 ## CI

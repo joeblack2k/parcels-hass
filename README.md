@@ -46,6 +46,8 @@ package_inbox:
   postnl_delivery_sensor: sensor.postnl_delivery
   public_qr_dir: package_inbox
   tracking_refresh_minutes: 60
+  tracking_scraper_url: ""
+  tracking_scraper_token: ""
 ```
 
 For postcode-gated carrier tracking, set your local receiver details in Home Assistant YAML:
@@ -57,6 +59,12 @@ package_inbox:
 ```
 
 Do not put personal receiver details in public bug reports or shared test fixtures.
+
+## Experimental local scraper
+
+For personal setups where FedEx blocks server-side tracking requests, Parcels can optionally call a local scraper sidecar before falling back to IMAP/public tracking. This is disabled by default and not required for HACS use.
+
+See [docs/fedex-scraper.md](docs/fedex-scraper.md) and [experimental/fedex-scraper](experimental/fedex-scraper).
 
 ## Services
 

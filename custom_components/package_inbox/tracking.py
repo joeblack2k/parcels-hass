@@ -24,6 +24,14 @@ from .const import (
 from .parser import clean_text
 
 
+NORMALIZED_TRACKING_STATUSES = {
+    STATUS_DELIVERED,
+    STATUS_EXPECTED_TODAY,
+    STATUS_IN_TRANSIT,
+    STATUS_READY_FOR_PICKUP,
+    STATUS_UNKNOWN,
+}
+
 PUBLIC_TRACKING_CARRIERS = {
     "postnl",
     "dhl",
@@ -173,6 +181,73 @@ def supports_public_tracking(carrier: str | None) -> bool:
     return normalize_carrier(carrier) in PUBLIC_TRACKING_CARRIERS
 
 
+def normalize_tracking_scraper_update(
+    payload: Any,
+    *,
+    carrier: str,
+    tracking_code: str,
+    tracking_url: str | None = None,
+    today: date | None = None,
+) -> dict[str, Any] | None:
+    """Normalize a local scraper sidecar response into integration fields."""
+    if not isinstance(payload, dict):
+        return None
+    today = today or date.today()
+    carrier_slug = normalize_carrier(payload.get("carrier") or carrier)
+    code = clean_text(str(payload.get("tracking_code") or tracking_code))
+    if not code:
+        return None
+
+    update: dict[str, Any] = {
+        "carrier": carrier_slug,
+        "tracking_code": code,
+        "tracking_url": payload.get("tracking_url") or tracking_url or build_tracking_url(carrier_slug, code),
+        "tracking_refresh_source": payload.get("tracking_refresh_source") or "local_tracking_scraper",
+        "tracking_refresh_supported": True,
+    }
+
+    if payload.get("tracking_refresh_error"):
+        update["tracking_refresh_error"] = clean_text(str(payload["tracking_refresh_error"]))
+
+    expected_date = _date_from_scraper_value(
+        payload.get("expected_date")
+        or payload.get("estimated_delivery")
+        or payload.get("delivery_date"),
+        today,
+    )
+    if expected_date:
+        update["expected_date"] = expected_date
+
+    start, end = _scraper_window(payload)
+    if start and end:
+        update["delivery_window_start"] = start
+        update["delivery_window_end"] = end
+
+    raw_status = clean_text(
+        str(
+            payload.get("raw_status")
+            or payload.get("tracking_status_text")
+            or payload.get("status_text")
+            or payload.get("status")
+            or ""
+        )
+    )
+    status_text = clean_text(str(payload.get("tracking_status_text") or payload.get("status_text") or raw_status))
+    if status_text:
+        update["tracking_status_text"] = status_text[:220]
+
+    update["status"] = _status_from_scraper_payload(payload.get("status"), raw_status, expected_date, today)
+
+    location = clean_text(str(payload.get("location") or ""))
+    if location and update.get("tracking_status_text") and location.lower() not in str(update["tracking_status_text"]).lower():
+        update["tracking_status_text"] = f"{update['tracking_status_text']} - {location}"[:220]
+
+    events = payload.get("events")
+    if isinstance(events, list) and events:
+        update["extra"] = {"tracking_events": events[:20]}
+    return update
+
+
 def _tracking_query(values: dict[str, str | None]) -> str:
     return urlencode({key: value for key, value in values.items() if value})
 
@@ -185,6 +260,52 @@ def _normalize_postcode(value: str | None) -> str | None:
 def _normalize_house_number(value: str | None) -> str | None:
     text = re.sub(r"\s+", "", str(value or "").strip())
     return text or None
+
+
+def _date_from_scraper_value(value: Any, today: date) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    parsed = _datetime_from_value(value)
+    if parsed:
+        return parsed.date().isoformat()
+    return _extract_expected_date(str(value), today)
+
+
+def _scraper_window(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    start = _time_from_any(payload.get("delivery_window_start") or payload.get("window_start"))
+    end = _time_from_any(payload.get("delivery_window_end") or payload.get("window_end"))
+    if start and end and start != end:
+        return (start, end)
+    timeframe = payload.get("delivery_timeframe") or payload.get("delivery_window")
+    return _extract_time_window(str(timeframe or ""))
+
+
+def _status_from_scraper_payload(
+    status: Any,
+    raw_status: str,
+    expected_date: str | None,
+    today: date,
+) -> str:
+    status_slug = re.sub(r"[^a-z0-9]+", "_", str(status or "").lower()).strip("_")
+    if status_slug in NORMALIZED_TRACKING_STATUSES:
+        return status_slug
+    text = clean_text(f"{status or ''} {raw_status}").lower()
+    if any(term in text for term in ("delivered", "afgeleverd", "bezorgd", "delivre", "delivree")):
+        return STATUS_DELIVERED
+    if any(term in text for term in ("out_for_delivery", "out for delivery", "on fedex vehicle for delivery")):
+        return STATUS_EXPECTED_TODAY
+    if any(term in text for term in ("exception", "failed", "failure", "clearance delay")):
+        return STATUS_UNKNOWN
+    inferred = _extract_status(text, expected_date, today)
+    if inferred != STATUS_UNKNOWN:
+        return inferred
+    if expected_date == today.isoformat():
+        return STATUS_EXPECTED_TODAY
+    return STATUS_UNKNOWN
 
 
 def extract_tracking_update(

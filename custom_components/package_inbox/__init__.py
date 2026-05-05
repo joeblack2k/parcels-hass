@@ -14,7 +14,7 @@ import mimetypes
 from pathlib import Path
 import re
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientTimeout
 import voluptuous as vol
@@ -42,6 +42,8 @@ from .const import (
     CONF_POSTNL_DELIVERY_SENSOR,
     CONF_PUBLIC_QR_DIR,
     CONF_TRACKING_REFRESH_MINUTES,
+    CONF_TRACKING_SCRAPER_TOKEN,
+    CONF_TRACKING_SCRAPER_URL,
     CONF_TRACKING_TIMEOUT,
     CONF_TRACKING_USER_AGENT,
     DEFAULT_AI_TASK_ENTITY,
@@ -52,6 +54,8 @@ from .const import (
     DEFAULT_POSTNL_DELIVERY_SENSOR,
     DEFAULT_PUBLIC_QR_DIR,
     DEFAULT_TRACKING_REFRESH_MINUTES,
+    DEFAULT_TRACKING_SCRAPER_TOKEN,
+    DEFAULT_TRACKING_SCRAPER_URL,
     DEFAULT_TRACKING_TIMEOUT,
     DEFAULT_TRACKING_USER_AGENT,
     DOMAIN,
@@ -83,6 +87,7 @@ from .tracking import (
     extract_tracking_update,
     extract_tracking_update_from_json,
     is_blocked_tracking_text,
+    normalize_tracking_scraper_update,
     supports_public_tracking,
 )
 from .window import DEFAULT_WINDOW_MARGIN_MINUTES, build_delivery_snapshot, dedupe_delivery_records
@@ -119,6 +124,8 @@ CONFIG_SCHEMA = vol.Schema(
                     vol.Range(min=5, max=60),
                 ),
                 vol.Optional(CONF_TRACKING_USER_AGENT, default=DEFAULT_TRACKING_USER_AGENT): cv.string,
+                vol.Optional(CONF_TRACKING_SCRAPER_URL, default=DEFAULT_TRACKING_SCRAPER_URL): cv.string,
+                vol.Optional(CONF_TRACKING_SCRAPER_TOKEN, default=DEFAULT_TRACKING_SCRAPER_TOKEN): cv.string,
             }
         )
     },
@@ -758,6 +765,10 @@ class PackageInboxManager:
                 supported=False,
             )
 
+        scraper_update = await self._async_fetch_tracking_scraper(record)
+        if scraper_update and _tracking_update_has_delivery_detail(scraper_update):
+            return scraper_update
+
         if not supports_public_tracking(carrier):
             return _tracking_error_update(
                 record,
@@ -908,6 +919,60 @@ class PackageInboxManager:
             )
         except ClientError as err:
             _LOGGER.debug("Tracking API failed for %s: %s", record.get("key"), err)
+            return None
+
+    async def _async_fetch_tracking_scraper(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        """Ask an optional local scraper sidecar for normalized tracking data."""
+        base_url = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_URL))
+        tracking_code = _clean_optional(record.get("tracking_code"))
+        carrier = _carrier_slug(record.get("carrier"))
+        if not base_url or not tracking_code or carrier not in {"fedex"}:
+            return None
+
+        endpoint = urljoin(base_url.rstrip("/") + "/", "track")
+        session = async_get_clientsession(self.hass)
+        timeout = ClientTimeout(total=int(self.config[CONF_TRACKING_TIMEOUT]))
+        headers = {
+            "User-Agent": self.config[CONF_TRACKING_USER_AGENT],
+            "Accept": "application/json",
+        }
+        token = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_TOKEN))
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            async with session.post(
+                endpoint,
+                json={
+                    "carrier": carrier,
+                    "tracking_code": tracking_code,
+                    "tracking_url": record.get("tracking_url")
+                    or build_tracking_url(carrier, tracking_code),
+                },
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                text = await response.text(errors="replace")
+                if response.status >= 400:
+                    _LOGGER.debug("Tracking scraper returned HTTP %s for %s", response.status, record.get("key"))
+                    return None
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    _LOGGER.debug("Tracking scraper returned non-JSON for %s", record.get("key"))
+                    return None
+                return normalize_tracking_scraper_update(
+                    payload,
+                    carrier=carrier,
+                    tracking_code=tracking_code,
+                    tracking_url=record.get("tracking_url"),
+                    today=dt_util.now().date(),
+                )
+        except TimeoutError:
+            _LOGGER.debug("Tracking scraper timed out for %s", record.get("key"))
+            return None
+        except ClientError as err:
+            _LOGGER.debug("Tracking scraper failed for %s: %s", record.get("key"), err)
             return None
 
     def _postnl_tracking_update(self, record: dict[str, Any]) -> dict[str, Any] | None:

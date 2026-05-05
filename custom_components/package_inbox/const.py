@@ -17,6 +17,8 @@ CONF_NOTIFY_SCRIPT = "notify_script"
 CONF_POSTNL_DELIVERY_SENSOR = "postnl_delivery_sensor"
 CONF_PUBLIC_QR_DIR = "public_qr_dir"
 CONF_TRACKING_REFRESH_MINUTES = "tracking_refresh_minutes"
+CONF_TRACKING_SCRAPER_TOKEN = "tracking_scraper_token"
+CONF_TRACKING_SCRAPER_URL = "tracking_scraper_url"
 CONF_TRACKING_TIMEOUT = "tracking_timeout"
 CONF_TRACKING_USER_AGENT = "tracking_user_agent"
 
@@ -28,6 +30,8 @@ DEFAULT_NOTIFY_SCRIPT = "persistent_notification.create"
 DEFAULT_POSTNL_DELIVERY_SENSOR = ""
 DEFAULT_PUBLIC_QR_DIR = "package_inbox"
 DEFAULT_TRACKING_REFRESH_MINUTES = 60
+DEFAULT_TRACKING_SCRAPER_TOKEN = ""
+DEFAULT_TRACKING_SCRAPER_URL = ""
 DEFAULT_TRACKING_TIMEOUT = 15
 DEFAULT_TRACKING_USER_AGENT = "Parcels for Home Assistant/0.2 (+https://github.com/joeblack2k/parcels-hass)"
 

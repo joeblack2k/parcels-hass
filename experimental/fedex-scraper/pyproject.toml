@@ -1,0 +1,20 @@
+[project]
+name = "parcels-fedex-scraper"
+version = "0.1.0"
+description = "Experimental local FedEx scraper sidecar for parcels-hass"
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.10",
+  "playwright>=1.45",
+]
+
+[project.scripts]
+parcels-fedex-scraper = "app.main:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
