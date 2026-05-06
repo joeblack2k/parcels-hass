@@ -204,6 +204,30 @@ def test_vinted_go_pickup_is_not_dhl_and_extracts_code_location():
     assert records[0]["pickup_location"] == "Vinted Go-pakketwinkel shoeby Schoolstraat 40 Voorschoten"
 
 
+def test_vinted_mail_keeps_vinted_source_and_embeds_chronopost_reference():
+    records = parse_email(
+        subject="Je Vinted pakket ligt klaar",
+        sender="no-reply@vinted.com",
+        text=(
+            "Je pakket ligt klaar bij DROOMVISIE Schoolstraat 109A Voorschoten. "
+            "Afhaalcode: 034049. "
+            "Chronopost tracking: XU152297803JF. "
+            "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF"
+        ),
+        today=date(2026, 5, 6),
+    )
+
+    assert len(records) == 1
+    assert records[0]["carrier"] == "vinted"
+    assert records[0]["status"] == "ready_for_pickup"
+    assert records[0]["pickup_code"] == "034049"
+    assert records[0]["extra"]["carrier_tracking"] == {
+        "carrier": "chronopost",
+        "tracking_code": "XU152297803JF",
+        "tracking_url": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF",
+    }
+
+
 def test_benu_apotheek_pickup_code_location():
     records = parse_email(
         subject="Bericht van uw BENU Apotheek",

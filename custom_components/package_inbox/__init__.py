@@ -79,6 +79,7 @@ from .const import (
 )
 from .dashboard import build_dashboard_snapshot
 from .parser import clean_text, is_likely_package_email, parse_email, stable_key
+from .record_merge import apply_vinted_cross_reference, merge_tracking_update
 from .tracking import (
     TRACKING_BLOCKED_ERROR,
     build_fedex_tracking_api_url,
@@ -391,7 +392,7 @@ class PackageInboxManager:
                 continue
 
             diagnostics.append(_tracking_diagnostic(key, record, update))
-            merged = _merge_tracking_update(current, update, dt_util.now().isoformat())
+            merged = merge_tracking_update(current, update, dt_util.now().isoformat())
             stored = await self._async_store_records([merged], notify=notify)
             refreshed.extend(stored)
 
@@ -542,7 +543,7 @@ class PackageInboxManager:
                 _LOGGER.debug("Tracking preflight failed for %s: %s", normalized.get("tracking_code"), err)
                 enriched.append(record)
                 continue
-            enriched.append(_merge_tracking_update(record, update, dt_util.now().isoformat()))
+            enriched.append(merge_tracking_update(record, update, dt_util.now().isoformat()))
         return enriched
 
     async def async_send_morning_summary(self, *, notify: bool) -> dict[str, Any]:
@@ -704,6 +705,7 @@ class PackageInboxManager:
 
         for record in records:
             normalized = _normalize_record(record)
+            normalized = apply_vinted_cross_reference(normalized, packages)
             key = normalized.get("key") or stable_key(normalized)
             normalized["key"] = key
             normalized["updated_at"] = now
@@ -2036,55 +2038,6 @@ def _append_history(previous: dict[str, Any], current: dict[str, Any]) -> list[d
     if previous_snapshot not in history[-3:]:
         history = [*history[-9:], previous_snapshot]
     return history
-
-
-def _merge_tracking_update(
-    record: dict[str, Any],
-    update: dict[str, Any],
-    checked_at: str,
-) -> dict[str, Any]:
-    merged = dict(record)
-    carrier = _carrier_slug(record.get("carrier") or update.get("carrier"))
-    for key, value in update.items():
-        if value is None:
-            continue
-        if key == "tracking_url" and record.get("tracking_url"):
-            continue
-        if key == "extra" and isinstance(value, dict):
-            previous_extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
-            merged["extra"] = {**previous_extra, **value}
-            continue
-        if key == "confidence" and _confidence_rank(value) < _confidence_rank(record.get("confidence")):
-            continue
-        if key == "status" and value == STATUS_UNKNOWN and record.get("status") != STATUS_UNKNOWN:
-            continue
-        merged[key] = value
-
-    merged["tracking_last_checked"] = checked_at
-    merged["tracking_refresh_has_delivery_detail"] = _tracking_update_has_delivery_detail(update)
-    if (
-        carrier == "chronopost"
-        and update.get("status") in (STATUS_IN_TRANSIT, STATUS_EXPECTED_TODAY, STATUS_DELIVERED)
-        and not update.get("pickup_location")
-    ):
-        merged["pickup_location"] = None
-        merged["pickup_code"] = None
-    if carrier == "chronopost" and update.get("status") == STATUS_IN_TRANSIT:
-        merged["expected_date"] = None
-        merged["delivery_window_start"] = None
-        merged["delivery_window_end"] = None
-    if merged.get("status") in (STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"):
-        merged["expected_date"] = None
-        merged["delivery_window_start"] = None
-        merged["delivery_window_end"] = None
-        merged["pickup_location"] = None
-        merged["pickup_code"] = None
-    elif merged.get("status") == STATUS_READY_FOR_PICKUP:
-        merged["delivery_window_start"] = None
-        merged["delivery_window_end"] = None
-    if not update.get("tracking_refresh_error"):
-        merged.pop("tracking_refresh_error", None)
-    return merged
 
 
 def _preferred_tracking_page_url(record: dict[str, Any], config: dict[str, Any] | None = None) -> str | None:

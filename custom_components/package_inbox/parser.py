@@ -210,6 +210,7 @@ def parse_email(
     carrier = _detect_carrier(combined)
     tracking_code = _extract_tracking_code(combined, carrier)
     tracking_url = _extract_tracking_url(combined, tracking_code, carrier)
+    carrier_tracking = _extract_embedded_carrier_tracking(combined, primary_carrier=carrier)
     expected_date = _extract_expected_date(combined, today)
     window_start, window_end = _extract_time_window(combined)
     status = _extract_status(combined, expected_date, today)
@@ -252,6 +253,7 @@ def parse_email(
         message_id=message_id,
         imap_uid=imap_uid,
         raw_excerpt=_excerpt(combined),
+        extra={"carrier_tracking": carrier_tracking} if carrier_tracking else {},
     )
     return [record.as_dict()]
 
@@ -502,6 +504,46 @@ def _extract_tracking_url(value: str, tracking_code: str | None, carrier: str | 
             "ups",
         } and any(keyword in host for keyword in CARRIER_KEYWORDS.get(carrier, ())):
             return url
+    return None
+
+
+def _extract_embedded_carrier_tracking(
+    value: str,
+    *,
+    primary_carrier: str,
+) -> dict[str, str] | None:
+    """Extract a carrier reference from a Vinted mail while keeping Vinted as source."""
+    if primary_carrier != "vinted":
+        return None
+
+    for url in _extract_urls(value):
+        carrier = detect_rule_carrier(url)
+        if carrier in {"unknown", "vinted"}:
+            continue
+        code = extract_rule_tracking_code_from_url(url, carrier) or extract_rule_tracking_code(url, carrier)
+        if code and valid_rule_tracking_code(code, carrier):
+            return {
+                "carrier": carrier,
+                "tracking_code": code,
+                "tracking_url": url,
+            }
+
+    lowered = value.lower()
+    for carrier, keywords in CARRIER_KEYWORDS.items():
+        if carrier in {"vinted", "amazon", "apotheek", "unknown"}:
+            continue
+        if not any(keyword in lowered for keyword in keywords):
+            continue
+        code = extract_rule_tracking_code(value, carrier)
+        if code and valid_rule_tracking_code(code, carrier):
+            reference = {
+                "carrier": carrier,
+                "tracking_code": code,
+            }
+            tracking_url = _extract_tracking_url(value, code, carrier)
+            if tracking_url:
+                reference["tracking_url"] = tracking_url
+            return reference
     return None
 
 
