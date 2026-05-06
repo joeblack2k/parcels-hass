@@ -1,4 +1,4 @@
-"""Local FedEx tracking scraper sidecar for personal parcels-hass setups."""
+"""Local tracking scraper sidecar for personal parcels-hass setups."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -20,8 +21,14 @@ from playwright.async_api import Browser, Error as PlaywrightError, async_playwr
 LOG = logging.getLogger("parcels_fedex_scraper")
 
 ADDON_OPTIONS_PATH = Path("/data/options.json")
+SERVICE_NAME = "parcels-tracking-scraper"
+VINTED_PROFILE_DIR = Path("/data/browser-profiles/vinted")
 FEDEX_HOME = "https://www.fedex.com/en-us/home.html"
 FEDEX_TRACKING_PAGE = "https://www.fedex.com/fedextrack/?trknbr={tracking_code}"
+CHRONOPOST_TRACKING_PAGE = "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT={tracking_code}"
+VINTED_HOME = "https://www.vinted.nl/"
+VINTED_LOGIN_URL = "https://www.vinted.nl/member/general/login"
+SUPPORTED_CARRIERS = {"fedex", "chronopost"}
 CAPTURE_URL_HINTS = (
     "trackingcal",
     "api.fedex.com/track/",
@@ -35,7 +42,43 @@ BLOCKED_HINTS = (
     "system down",
     "access denied",
     "captcha",
+    "cloudflare",
+    "just a moment",
+    "enable javascript and cookies",
 )
+CHRONOPOST_CAPTURE_HINTS = (
+    "chronopost",
+    "suivi",
+    "tracking",
+    "idship",
+    "shipment",
+    "track",
+)
+CHRONOPOST_PICKUP_HINTS = (
+    "pick up point",
+    "point relais",
+    "relais pickup",
+    "point pickup",
+    "point de retrait",
+    "bureau de poste",
+    "commerce",
+    "commercant",
+    "afhaalpunt",
+    "pickup point",
+    "collection point",
+    "mis a disposition",
+    "a retirer",
+    "disponible au point",
+)
+PLACEHOLDER_PICKUP_LOCATIONS = {
+    "normal",
+    "pickup",
+    "pick up point",
+    "point relais",
+    "relais point",
+    "chronopost relais point",
+    "chronopost relay point",
+}
 
 
 @dataclass(slots=True)
@@ -45,10 +88,18 @@ class Settings:
     token: str
     headless: bool
     timeout: int
+    vinted_auto_login: bool
+    vinted_email: str
+    vinted_password: str
+    vinted_login_interval_hours: int
+    vinted_login_on_start: bool
 
 
 def settings_from_env() -> Settings:
-    addon_options = load_addon_options()
+    return settings_from_options(load_addon_options())
+
+
+def settings_from_options(addon_options: dict[str, Any]) -> Settings:
     return Settings(
         host=os.environ.get("HOST", "127.0.0.1"),
         port=parse_int(os.environ.get("PORT"), parse_int(addon_options.get("port"), 8765)),
@@ -61,6 +112,11 @@ def settings_from_env() -> Settings:
             addon_options.get("timeout"),
             parse_int(os.environ.get("FEDEX_SCRAPER_TIMEOUT"), 45),
         ),
+        vinted_auto_login=parse_bool(addon_options.get("vinted_auto_login"), False),
+        vinted_email=str(addon_options.get("vinted_email") or os.environ.get("VINTED_EMAIL") or ""),
+        vinted_password=str(addon_options.get("vinted_password") or os.environ.get("VINTED_PASSWORD") or ""),
+        vinted_login_interval_hours=parse_int(addon_options.get("vinted_login_interval_hours"), 22),
+        vinted_login_on_start=parse_bool(addon_options.get("vinted_login_on_start"), True),
     )
 
 
@@ -113,12 +169,22 @@ async def health(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "parcels-fedex-scraper",
+            "service": SERVICE_NAME,
             "started_at": request.app.get("started_at"),
             "headless": settings.headless,
             "timeout": settings.timeout,
+            "vinted": vinted_status_payload(request.app),
         }
     )
+
+
+async def vinted_login_status(request: web.Request) -> web.Response:
+    return web.json_response(vinted_status_payload(request.app))
+
+
+async def vinted_login_refresh(request: web.Request) -> web.Response:
+    result = await refresh_vinted_login(request.app, reason="manual")
+    return web.json_response(result)
 
 
 async def track(request: web.Request) -> web.Response:
@@ -129,36 +195,58 @@ async def track(request: web.Request) -> web.Response:
 
     carrier = str(payload.get("carrier") or "fedex").strip().lower()
     tracking_code = normalize_tracking_code(payload.get("tracking_code"))
-    if carrier != "fedex":
-        raise web.HTTPBadRequest(text="only fedex is supported by this sidecar")
+    if carrier not in SUPPORTED_CARRIERS:
+        raise web.HTTPBadRequest(text=f"unsupported carrier: {carrier}")
     if not tracking_code:
         raise web.HTTPBadRequest(text="missing tracking_code")
 
-    tracking_url = str(payload.get("tracking_url") or "").strip() or FEDEX_TRACKING_PAGE.format(
-        tracking_code=quote_plus(tracking_code)
-    )
+    tracking_url = str(payload.get("tracking_url") or "").strip() or default_tracking_url(carrier, tracking_code)
     timeout = request.app["settings"].timeout
     try:
-        result = await asyncio.wait_for(
-            scrape_fedex(
+        if carrier == "chronopost":
+            scrape = scrape_chronopost(
                 request.app["browser"],
                 tracking_code=tracking_code,
                 tracking_url=tracking_url,
                 timeout=timeout,
-            ),
+            )
+        else:
+            scrape = scrape_fedex(
+                request.app["browser"],
+                tracking_code=tracking_code,
+                tracking_url=tracking_url,
+                timeout=timeout,
+            )
+        result = await asyncio.wait_for(
+            scrape,
             timeout=timeout,
         )
     except TimeoutError:
-        LOG.info("FedEx scrape timed out after %ss for %s", timeout, redact_tracking_code(tracking_code))
-        result = error_update(tracking_code, tracking_url, f"scraper_timeout_{timeout}s")
+        LOG.info(
+            "%s scrape timed out after %ss for %s",
+            carrier_label(carrier),
+            timeout,
+            redact_tracking_code(tracking_code),
+        )
+        result = error_update(tracking_code, tracking_url, f"scraper_timeout_{timeout}s", carrier=carrier)
     LOG.info(
-        "FedEx tracking %s -> status=%s error=%s source=%s",
+        "%s tracking %s -> status=%s error=%s source=%s",
+        carrier_label(carrier),
         redact_tracking_code(tracking_code),
         result.get("status"),
         result.get("tracking_refresh_error") or "-",
         result.get("tracking_refresh_source") or "-",
     )
     return web.json_response(result)
+
+
+def default_tracking_url(carrier: str, tracking_code: str) -> str:
+    template = CHRONOPOST_TRACKING_PAGE if carrier == "chronopost" else FEDEX_TRACKING_PAGE
+    return template.format(tracking_code=quote_plus(tracking_code))
+
+
+def carrier_label(carrier: str) -> str:
+    return "Chronopost" if carrier == "chronopost" else "FedEx"
 
 
 def normalize_tracking_code(value: Any) -> str:
@@ -222,6 +310,597 @@ async def scrape_fedex(
         return error_update(tracking_code, tracking_url, f"playwright_error: {err}")
     finally:
         await context.close()
+
+
+async def scrape_chronopost(
+    browser: Browser,
+    *,
+    tracking_code: str,
+    tracking_url: str,
+    timeout: int,
+) -> dict[str, Any]:
+    context = await browser.new_context(
+        locale="nl-NL",
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        ),
+    )
+    page = await context.new_page()
+    json_payloads: list[tuple[str, Any]] = []
+
+    async def capture_response(response) -> None:
+        url = response.url.lower()
+        if not any(hint in url for hint in CHRONOPOST_CAPTURE_HINTS):
+            return
+        try:
+            payload = await response.json()
+        except Exception:
+            return
+        json_payloads.append((response.url, payload))
+
+    page.on("response", lambda response: asyncio.create_task(capture_response(response)))
+
+    try:
+        await page.goto(tracking_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        await dismiss_cookie_banner(page)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 15000))
+        except PlaywrightError:
+            pass
+        await page.wait_for_timeout(min(5000, max(1000, timeout * 250)))
+        for _ in range(3):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(750)
+
+        page_text = await page.locator("body").inner_text(timeout=5000)
+        page_update = normalize_chronopost_text(page_text, tracking_code=tracking_code, tracking_url=tracking_url)
+        if has_delivery_detail(page_update):
+            return page_update
+
+        for source_url, payload in reversed(json_payloads):
+            update = normalize_chronopost_json(
+                payload,
+                tracking_code=tracking_code,
+                tracking_url=tracking_url,
+                source_url=source_url,
+            )
+            if has_delivery_detail(update):
+                return update
+
+        return page_update
+    except PlaywrightError as err:
+        LOG.warning("Chronopost Playwright error for %s: %s", redact_tracking_code(tracking_code), err)
+        return error_update(tracking_code, tracking_url, f"playwright_error: {err}", carrier="chronopost")
+    finally:
+        await context.close()
+
+
+async def dismiss_cookie_banner(page) -> None:
+    for label in ("Tout accepter", "Accepter", "Accept all", "Accept"):
+        try:
+            await page.get_by_role("button", name=re.compile(label, re.IGNORECASE)).click(timeout=1000)
+            return
+        except PlaywrightError:
+            continue
+
+
+def normalize_chronopost_json(
+    payload: Any,
+    *,
+    tracking_code: str,
+    tracking_url: str,
+    source_url: str,
+) -> dict[str, Any]:
+    """Normalize Chronopost JSON-ish browser responses by reusing the text parser."""
+
+    text = "\n".join(flatten_strings(payload))
+    update = normalize_chronopost_text(text, tracking_code=tracking_code, tracking_url=tracking_url)
+    update["tracking_api_url"] = source_url
+    return update
+
+
+def normalize_chronopost_text(
+    page_text: str,
+    *,
+    tracking_code: str,
+    tracking_url: str,
+) -> dict[str, Any]:
+    lines = meaningful_lines(page_text)
+    text = "\n".join(lines)
+    folded = fold_text(text)
+    if any(hint in folded for hint in BLOCKED_HINTS):
+        return error_update(tracking_code, tracking_url, "chronopost_page_blocked_or_permission", carrier="chronopost")
+
+    latest_status, latest_text = chronopost_latest_status(lines)
+    status = latest_status or map_chronopost_status(folded)
+    pickup_location = chronopost_pickup_location(lines) if status == "ready_for_pickup" else ""
+    status_text = latest_text or chronopost_status_text(lines, status=status, pickup_location=pickup_location)
+    expected = "" if latest_status in {"in_transit", "delivered"} else chronopost_date(text)
+    start, end = chronopost_window(text)
+
+    update = {
+        "carrier": "chronopost",
+        "tracking_code": tracking_code,
+        "tracking_url": tracking_url,
+        "status": status,
+        "raw_status": status_text,
+        "tracking_status_text": status_text or text[:220],
+        "tracking_refresh_source": "local_tracking_scraper",
+        "tracking_refresh_supported": True,
+    }
+    if pickup_location:
+        update["pickup_location"] = pickup_location
+        update["status"] = "ready_for_pickup"
+        update["tracking_status_text"] = f"Afhalen bij {pickup_location}"[:220]
+        return update
+    if expected:
+        update["expected_date"] = expected
+    if start and end:
+        update["delivery_window_start"] = start
+        update["delivery_window_end"] = end
+    if status == "unknown" and not expected and not (start and end):
+        update["tracking_refresh_error"] = "chronopost_no_delivery_detail"
+    return update
+
+
+def chronopost_latest_status(lines: list[str]) -> tuple[str, str]:
+    """Return status from the newest visible Chronopost event.
+
+    Chronopost shows newest events first. Older setup fields can contain
+    "Pick up point", but those are not the current parcel state.
+    """
+
+    for index, line in enumerate(lines):
+        folded = fold_text(line)
+        if "pick up point :" in folded:
+            break
+        if is_chronopost_status_noise(line):
+            continue
+        status = chronopost_status_from_event_text(folded)
+        if status:
+            location = chronopost_event_location(lines, index)
+            text = f"{line} - {location}" if location else line
+            return status, text[:220]
+    return "", ""
+
+
+def chronopost_event_location(lines: list[str], status_index: int) -> str:
+    for candidate in reversed(lines[max(0, status_index - 4) : status_index]):
+        if is_chronopost_status_noise(candidate):
+            continue
+        folded = fold_text(candidate)
+        if chronopost_status_from_event_text(folded):
+            continue
+        if "chronopost" in folded or re.search(r"\b[A-Z]{2,}\b", candidate):
+            return candidate[:120]
+    return ""
+
+
+def chronopost_status_from_event_text(folded: str) -> str:
+    if any(
+        term in folded
+        for term in (
+            "shipment in transit",
+            "outbound linehaul scan",
+            "sorted at departure location",
+            "parcel collected by carrier",
+            "parcel handed over from pickup point to the driver",
+            "shipment handed over by shipper",
+            "shipment in preparation to be shipped",
+            "sending supported by chronopost, in transit",
+            "acheminement",
+            "pris en charge",
+            "centre de tri",
+            "transit",
+        )
+    ):
+        return "in_transit"
+    if any(
+        term in folded
+        for term in (
+            "disponible au point",
+            "mis a disposition",
+            "a retirer",
+            "ready for pickup",
+            "available at pickup point",
+            "available at pick up point",
+            "delivered at pickup point",
+            "delivered to pickup point",
+            "livre au point relais",
+            "livre en point relais",
+            "livre dans un point relais",
+            "livre a un point relais",
+        )
+    ):
+        return "ready_for_pickup"
+    if any(term in folded for term in ("out for delivery", "en cours de livraison", "sera livre aujourd")):
+        return "expected_today"
+    if any(term in folded for term in ("delivered", "remis au destinataire", "colis remis", "colis livre")):
+        return "delivered"
+    return ""
+
+
+def is_chronopost_status_noise(line: str) -> bool:
+    folded = fold_text(line)
+    if not folded:
+        return True
+    if re.match(r"^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", folded):
+        return True
+    if re.match(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b", folded):
+        return True
+    if re.match(r"^\d{1,2}:\d{2}\s*(?:am|pm)?$", folded):
+        return True
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]20\d{2}\b", folded):
+        return True
+    return any(
+        term in folded
+        for term in (
+            "estimated delivery date",
+            "subscribe to my parcel tracking",
+            "some tips",
+            "the steps of my delivery",
+            "type of collection point",
+            "partner number",
+        )
+    )
+
+
+def has_delivery_detail(update: dict[str, Any] | None) -> bool:
+    if not update or update.get("tracking_refresh_error"):
+        return False
+    if update.get("pickup_location") and not is_placeholder_pickup_location(str(update.get("pickup_location"))):
+        return True
+    if update.get("expected_date"):
+        return True
+    if update.get("delivery_window_start") and update.get("delivery_window_end"):
+        return True
+    return update.get("status") not in {None, "", "unknown"}
+
+
+def map_chronopost_status(text: str, *, has_pickup_location: bool = False) -> str:
+    if any(
+        term in text
+        for term in (
+            "disponible au point",
+            "mis a disposition",
+            "a retirer",
+            "ready for pickup",
+            "available at pickup point",
+            "available at pick up point",
+            "delivered at pickup point",
+            "delivered to pickup point",
+            "livre au point relais",
+            "livre en point relais",
+            "livre dans un point relais",
+            "livre a un point relais",
+        )
+    ):
+        return "ready_for_pickup"
+    if any(term in text for term in ("delivered", "remis au destinataire", "colis remis", "colis livre")):
+        return "delivered"
+    if any(term in text for term in ("en cours de livraison", "livraison prevue aujourd", "sera livre aujourd")):
+        return "expected_today"
+    if any(term in text for term in ("acheminement", "pris en charge", "centre de tri", "arrive", "transit")):
+        return "in_transit"
+    return "unknown"
+
+
+def chronopost_status_text(lines: list[str], *, status: str, pickup_location: str) -> str:
+    if pickup_location:
+        return f"Afhalen bij {pickup_location}"
+    folded_terms = {
+        "expected_today": ("en cours de livraison", "livraison prevue", "sera livre"),
+        "in_transit": ("acheminement", "pris en charge", "centre de tri", "arrive", "transit"),
+        "delivered": ("livre", "remis au destinataire"),
+        "ready_for_pickup": CHRONOPOST_PICKUP_HINTS,
+    }.get(status, ())
+    for line in lines:
+        folded = fold_text(line)
+        if any(term in folded for term in folded_terms):
+            return line[:220]
+    return (lines[0] if lines else "")[:220]
+
+
+def chronopost_pickup_location(lines: list[str]) -> str:
+    explicit = explicit_chronopost_pickup_location(lines)
+    if explicit:
+        return explicit
+
+    for index, line in enumerate(lines):
+        folded = fold_text(line)
+        if is_non_destination_pickup_line(line):
+            continue
+        if not any(hint in folded for hint in CHRONOPOST_PICKUP_HINTS):
+            continue
+        if not is_destination_pickup_hint_line(line):
+            continue
+        pieces: list[str] = []
+        after = text_after_pickup_hint(line)
+        if is_location_piece(after):
+            pieces.append(after)
+        for extra in lines[index + 1 : index + 8]:
+            if len(pieces) >= 4:
+                break
+            if is_location_stop_line(extra, have_location=bool(pieces)):
+                if pieces:
+                    break
+                continue
+            if is_location_piece(extra):
+                pieces.append(extra)
+        location = format_location(pieces)
+        if location:
+            return location
+    return ""
+
+
+def is_destination_pickup_hint_line(line: str) -> bool:
+    folded = fold_text(line)
+    return any(
+        term in folded
+        for term in (
+            "disponible au point",
+            "mis a disposition",
+            "a retirer",
+            "ready for pickup",
+            "available at pickup point",
+            "available at pick up point",
+            "delivered at pickup point",
+            "delivered to pickup point",
+            "livre au point relais",
+            "livre en point relais",
+            "livre dans un point relais",
+            "livre a un point relais",
+            "sera livre dans le point relais",
+            "sera livre dans le point pickup",
+            "livre dans le point relais",
+            "livre dans le point pickup",
+        )
+    )
+
+
+def explicit_chronopost_pickup_location(lines: list[str]) -> str:
+    """Extract Chronopost's destination pickup field.
+
+    Chronopost renders this as:
+    Pick up point : SHOP - STREET 1 - 1234 AB - CITY - NL
+    The browser text can wrap after a dash, so a couple of continuation lines
+    are folded in before parsing.
+    """
+
+    for index, line in enumerate(lines):
+        match = re.search(r"\bpick\s*up\s*point\s*:\s*(.+)", line, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).strip()
+        for extra in lines[index + 1 : index + 4]:
+            if not looks_like_pickup_point_continuation(candidate, extra):
+                break
+            candidate = f"{candidate} {extra}".strip()
+        location = format_explicit_pickup_point(candidate)
+        if location:
+            return location
+    return ""
+
+
+def looks_like_pickup_point_continuation(candidate: str, extra: str) -> bool:
+    folded = fold_text(extra)
+    if not extra or is_location_stop_line(extra, have_location=True):
+        return False
+    if any(term in folded for term in ("i wish", "subscribe", "general condition", "validate", "frequently asked")):
+        return False
+    if candidate.rstrip().endswith("-"):
+        return True
+    if re.search(r"\b\d{4}\s?[A-Z]{2}\b", extra):
+        return True
+    return bool(re.search(r"\s-\s", extra) and len(extra) <= 120)
+
+
+def format_explicit_pickup_point(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" -:;,")
+    text = re.sub(r"\s+-\s+", " - ", text)
+    text = re.sub(r"-\s+", "- ", text)
+    text = re.sub(r"\s+-", " -", text)
+    parts = [clean_location_piece(part) for part in re.split(r"\s+-\s+", text)]
+    parts = [part for part in parts if part]
+    if len(parts) >= 3:
+        return " - ".join(parts[:5])[:180]
+    return ""
+
+
+def is_non_destination_pickup_line(line: str) -> bool:
+    folded = fold_text(line)
+    return any(
+        term in folded
+        for term in (
+            "handed over from pickup point to the driver",
+            "from pickup point to the driver",
+            "type of collection point",
+            "collection point type",
+            "pickup point type",
+            "parcel handed over from pickup point",
+        )
+    )
+
+
+def text_after_pickup_hint(line: str) -> str:
+    folded = fold_text(line)
+    best_pos = -1
+    best_hint = ""
+    for hint in CHRONOPOST_PICKUP_HINTS:
+        pos = folded.find(hint)
+        if pos >= 0 and (best_pos < 0 or pos < best_pos):
+            best_pos = pos
+            best_hint = hint
+    if best_pos < 0:
+        return ""
+    raw_after = line[best_pos + len(best_hint) :]
+    raw_after = re.sub(r"^[\s:,\-.]+", "", raw_after)
+    raw_after = re.sub(r"^(pickup|relais|point)\b[\s:,\-.]*", "", raw_after, flags=re.IGNORECASE)
+    return raw_after.strip()
+
+
+def is_location_piece(value: str) -> bool:
+    text = clean_location_piece(value)
+    if len(text) < 3 or len(text) > 120:
+        return False
+    folded = fold_text(text)
+    if re.match(r"^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", folded):
+        return False
+    if re.match(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b", folded):
+        return False
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]20\d{2}\b", folded):
+        return False
+    if folded.startswith("type :") or folded.startswith("type:"):
+        return False
+    if is_placeholder_pickup_location(text):
+        return False
+    if is_location_stop_line(text, have_location=False):
+        return False
+    if any(term in folded for term in ("colis", "livraison", "suivre", "historique", "connexion", "loading")):
+        return False
+    return bool(re.search(r"\d", text) or re.search(r"\b[A-Z0-9][A-Z0-9&' -]{2,}\b", text))
+
+
+def is_location_stop_line(value: str, *, have_location: bool) -> bool:
+    folded = fold_text(value)
+    stop_terms = (
+        "historique",
+        "suivre",
+        "suivez",
+        "numero",
+        "n de colis",
+        "etape",
+        "date",
+        "contact",
+        "se connecter",
+        "loading",
+        "chronopost",
+    )
+    if any(term in folded for term in stop_terms):
+        return True
+    if have_location and any(term in folded for term in ("colis", "livraison", "expediteur", "destinataire")):
+        return True
+    return False
+
+
+def format_location(pieces: list[str]) -> str:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for piece in pieces:
+        text = clean_location_piece(piece)
+        if not text:
+            continue
+        key = fold_text(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return ", ".join(cleaned)[:180]
+
+
+def is_placeholder_pickup_location(value: str) -> bool:
+    return fold_text(value) in PLACEHOLDER_PICKUP_LOCATIONS
+
+
+def clean_location_piece(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:-")
+    text = re.sub(r"\s+le\s+\d{1,2}\s+[A-Za-z]+.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+(aujourd'hui|demain).*$", "", text, flags=re.IGNORECASE)
+    return text.strip(" ,.;:-")
+
+
+def chronopost_date(value: str) -> str:
+    iso = date_from_any(value)
+    if iso:
+        return iso
+    folded = fold_text(value)
+    months = {
+        "janvier": 1,
+        "fevrier": 2,
+        "mars": 3,
+        "avril": 4,
+        "mai": 5,
+        "juin": 6,
+        "juillet": 7,
+        "aout": 8,
+        "septembre": 9,
+        "octobre": 10,
+        "novembre": 11,
+        "decembre": 12,
+    }
+    match = re.search(
+        r"\b(\d{1,2})\s+("
+        + "|".join(months)
+        + r")(?:\s+(20\d{2}))?\b",
+        folded,
+    )
+    if not match:
+        return ""
+    year = int(match.group(3) or datetime.now().year)
+    try:
+        return datetime(year, months[match.group(2)], int(match.group(1))).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def chronopost_window(value: str) -> tuple[str, str]:
+    match = re.search(r"\b([0-2]?\d[:.h][0-5]\d)\s*(?:-|a|et|/)\s*([0-2]?\d[:.h][0-5]\d)\b", fold_text(value))
+    if not match:
+        return ("", "")
+    start = time_from_any(match.group(1))
+    end = time_from_any(match.group(2))
+    return (start, end) if start and end and start != end else ("", "")
+
+
+def meaningful_lines(value: str) -> list[str]:
+    raw_lines = re.split(r"[\r\n]+", str(value or ""))
+    if len(raw_lines) <= 1:
+        raw_lines = re.split(r"\s{2,}", str(value or ""))
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_lines:
+        line = re.sub(r"\s+", " ", html.unescape(raw)).strip()
+        if not line:
+            continue
+        key = fold_text(line)
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in {"x", "menu", "ok", "fr", "nl", "en"}:
+            continue
+        lines.append(line)
+    return lines[:120]
+
+
+def flatten_strings(value: Any, *, limit: int = 300) -> list[str]:
+    results: list[str] = []
+
+    def walk(item: Any) -> None:
+        if len(results) >= limit:
+            return
+        if isinstance(item, dict):
+            for nested in item.values():
+                walk(nested)
+            return
+        if isinstance(item, list):
+            for nested in item:
+                walk(nested)
+            return
+        if item is None or isinstance(item, (bool, int, float)):
+            return
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        if len(text) >= 2:
+            results.append(text)
+
+    walk(value)
+    return results
+
+
+def fold_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", ascii_text).strip().lower()
 
 
 def normalize_fedex_json(payload: Any, *, tracking_code: str, source_url: str) -> dict[str, Any]:
@@ -448,9 +1127,15 @@ def html_to_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def error_update(tracking_code: str, tracking_url: str | None, error: str) -> dict[str, Any]:
+def error_update(
+    tracking_code: str,
+    tracking_url: str | None,
+    error: str,
+    *,
+    carrier: str = "fedex",
+) -> dict[str, Any]:
     update = {
-        "carrier": "fedex",
+        "carrier": carrier,
         "tracking_code": tracking_code,
         "status": "unknown",
         "tracking_refresh_source": "local_tracking_scraper",
@@ -460,6 +1145,235 @@ def error_update(tracking_code: str, tracking_url: str | None, error: str) -> di
     if tracking_url:
         update["tracking_url"] = tracking_url
     return update
+
+
+def vinted_configured(settings: Settings) -> bool:
+    return bool(settings.vinted_email and settings.vinted_password)
+
+
+def vinted_status_payload(app: web.Application) -> dict[str, Any]:
+    settings = app["settings"]
+    state = dict(app.get("vinted_login_state") or {})
+    return {
+        "auto_login": settings.vinted_auto_login,
+        "configured": vinted_configured(settings),
+        "profile_exists": VINTED_PROFILE_DIR.exists(),
+        "interval_hours": settings.vinted_login_interval_hours,
+        "state": state,
+    }
+
+
+def vinted_login_blocker(text: str) -> str:
+    lowered = fold_text(text)
+    if any(term in lowered for term in ("captcha", "are you human", "unusual activity", "verdachte activiteit")):
+        return "captcha_required"
+    if any(term in lowered for term in ("verification code", "verificatiecode", "two-factor", "2fa", "security code")):
+        return "two_factor_required"
+    if any(term in lowered for term in ("incorrect", "wrong password", "ongeldig", "onjuist", "verkeerd wachtwoord")):
+        return "invalid_credentials"
+    return ""
+
+
+async def refresh_vinted_login(app: web.Application, *, reason: str) -> dict[str, Any]:
+    settings: Settings = app["settings"]
+    if not settings.vinted_auto_login:
+        return set_vinted_login_state(app, status="disabled", reason=reason)
+    if not vinted_configured(settings):
+        return set_vinted_login_state(app, status="missing_credentials", reason=reason)
+
+    lock: asyncio.Lock = app["vinted_login_lock"]
+    async with lock:
+        return await run_vinted_login(app, reason=reason)
+
+
+async def run_vinted_login(app: web.Application, *, reason: str) -> dict[str, Any]:
+    settings: Settings = app["settings"]
+    playwright = app["playwright"]
+    VINTED_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    context = await playwright.chromium.launch_persistent_context(
+        user_data_dir=str(VINTED_PROFILE_DIR),
+        headless=settings.headless,
+        locale="nl-NL",
+        args=["--disable-dev-shm-usage"],
+    )
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        await page.goto(VINTED_HOME, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
+        await dismiss_vinted_overlays(page)
+        if await vinted_page_looks_logged_in(page):
+            return set_vinted_login_state(app, status="ok", reason=reason, detail="already_logged_in")
+
+        await page.goto(VINTED_LOGIN_URL, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
+        await dismiss_vinted_overlays(page)
+        filled = await fill_vinted_credentials(page, settings)
+        if not filled:
+            text = await safe_body_text(page)
+            blocker = vinted_login_blocker(text)
+            return set_vinted_login_state(app, status=blocker or "login_form_not_found", reason=reason)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=min(settings.timeout * 1000, 15000))
+        except PlaywrightError:
+            pass
+        await page.wait_for_timeout(1500)
+        await dismiss_vinted_overlays(page)
+        text = await safe_body_text(page)
+        blocker = vinted_login_blocker(text)
+        if blocker:
+            return set_vinted_login_state(app, status=blocker, reason=reason)
+        if await vinted_page_looks_logged_in(page):
+            return set_vinted_login_state(app, status="ok", reason=reason, detail="submitted_credentials")
+        return set_vinted_login_state(app, status="login_required", reason=reason)
+    except PlaywrightError as err:
+        LOG.warning("Vinted login refresh failed: %s", err)
+        return set_vinted_login_state(app, status="playwright_error", reason=reason, detail=str(err)[:160])
+    finally:
+        await context.close()
+
+
+async def dismiss_vinted_overlays(page) -> None:
+    for label in (
+        "Alles accepteren",
+        "Accepteren",
+        "Accept all",
+        "Accept",
+        "Akkoord",
+        "OK",
+    ):
+        try:
+            await page.get_by_role("button", name=re.compile(label, re.IGNORECASE)).click(timeout=750)
+            return
+        except PlaywrightError:
+            continue
+
+
+async def fill_vinted_credentials(page, settings: Settings) -> bool:
+    email_filled = await fill_first_locator(
+        page,
+        (
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[name="login"]',
+            'input[name="username"]',
+            'input[autocomplete="username"]',
+        ),
+        settings.vinted_email,
+    )
+    password_filled = await fill_first_locator(
+        page,
+        (
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[autocomplete="current-password"]',
+        ),
+        settings.vinted_password,
+    )
+    if not (email_filled and password_filled):
+        return False
+
+    for label in ("Inloggen", "Log in", "Aanmelden", "Sign in", "Continue", "Doorgaan"):
+        try:
+            await page.get_by_role("button", name=re.compile(label, re.IGNORECASE)).click(timeout=1500)
+            return True
+        except PlaywrightError:
+            continue
+    try:
+        await page.locator('button[type="submit"], input[type="submit"]').first.click(timeout=1500)
+        return True
+    except PlaywrightError:
+        return False
+
+
+async def fill_first_locator(page, selectors: tuple[str, ...], value: str) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            await locator.fill(value, timeout=1500)
+            return True
+        except PlaywrightError:
+            continue
+    return False
+
+
+async def vinted_page_looks_logged_in(page) -> bool:
+    url = page.url.lower()
+    if "login" in url or "sign-in" in url:
+        return False
+    for selector in (
+        '[data-testid*="inbox"]',
+        '[data-testid*="profile"]',
+        'a[href*="/inbox"]',
+        'a[href*="/member/"]',
+    ):
+        try:
+            if await page.locator(selector).count() > 0:
+                return True
+        except PlaywrightError:
+            continue
+    text = await safe_body_text(page)
+    folded = fold_text(text)
+    return any(term in folded for term in ("mijn profiel", "berichten", "favorieten", "my profile", "inbox"))
+
+
+async def safe_body_text(page) -> str:
+    try:
+        return await page.locator("body").inner_text(timeout=3000)
+    except PlaywrightError:
+        return ""
+
+
+def set_vinted_login_state(
+    app: web.Application,
+    *,
+    status: str,
+    reason: str,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if detail:
+        state["detail"] = detail
+    app["vinted_login_state"] = state
+    LOG.info("Vinted login refresh -> status=%s reason=%s", status, reason)
+    return state
+
+
+async def start_vinted_login_task(app: web.Application) -> None:
+    app["vinted_login_lock"] = asyncio.Lock()
+    settings: Settings = app["settings"]
+    if not settings.vinted_auto_login:
+        app["vinted_login_state"] = {"status": "disabled", "updated_at": None}
+        return
+    if not vinted_configured(settings):
+        app["vinted_login_state"] = {
+            "status": "missing_credentials",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return
+    app["vinted_login_task"] = asyncio.create_task(vinted_login_loop(app))
+
+
+async def stop_vinted_login_task(app: web.Application) -> None:
+    task = app.get("vinted_login_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def vinted_login_loop(app: web.Application) -> None:
+    settings: Settings = app["settings"]
+    if settings.vinted_login_on_start:
+        await refresh_vinted_login(app, reason="startup")
+    interval = max(1, settings.vinted_login_interval_hours) * 3600
+    while True:
+        await asyncio.sleep(interval)
+        await refresh_vinted_login(app, reason="scheduled")
 
 
 async def start_browser(app: web.Application) -> None:
@@ -484,8 +1398,12 @@ def create_app(settings: Settings | None = None) -> web.Application:
     app["settings"] = settings or settings_from_env()
     app["started_at"] = datetime.now(timezone.utc).isoformat()
     app.router.add_get("/health", health)
+    app.router.add_get("/login/vinted/status", vinted_login_status)
+    app.router.add_post("/login/vinted", vinted_login_refresh)
     app.router.add_post("/track", track)
     app.on_startup.append(start_browser)
+    app.on_startup.append(start_vinted_login_task)
+    app.on_cleanup.append(stop_vinted_login_task)
     app.on_cleanup.append(stop_browser)
     return app
 
@@ -502,7 +1420,7 @@ def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     settings = settings_from_env()
     hosts = bind_hosts(settings.host)
-    LOG.info("Starting Parcels FedEx scraper on %s:%s", hosts, settings.port)
+    LOG.info("Starting Parcels tracking scraper on %s:%s", hosts, settings.port)
     web.run_app(create_app(settings), host=hosts, port=settings.port)
 
 

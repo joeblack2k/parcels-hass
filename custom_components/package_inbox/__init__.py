@@ -101,6 +101,7 @@ AI_CARRIER_LIST = (
     "postnl|dhl|dpd|gls|fedex|chronopost|ups|trunkrs|homerr|cycloon|instabox|"
     "transmission|dachser|dynalogic|gofo|dragonfly|amazon|vinted|apotheek|unknown"
 )
+TRACKING_SCRAPER_CARRIERS = {"fedex", "chronopost"}
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -626,6 +627,8 @@ class PackageInboxManager:
             record["expected_date"] = None
             record["delivery_window_start"] = None
             record["delivery_window_end"] = None
+            record["pickup_location"] = None
+            record["pickup_code"] = None
             timestamp_key = {
                 STATUS_DELIVERED: "delivered_at",
                 STATUS_PICKED_UP: "picked_up_at",
@@ -635,6 +638,9 @@ class PackageInboxManager:
         elif record["status"] == STATUS_READY_FOR_PICKUP:
             record["delivery_window_start"] = None
             record["delivery_window_end"] = None
+        elif record["status"] in (STATUS_IN_TRANSIT, STATUS_EXPECTED_TODAY, STATUS_UNKNOWN):
+            record["pickup_location"] = None
+            record["pickup_code"] = None
         record["extra"] = {**extra, "status_changed_at": now}
 
         stored = await self._async_store_records([record], notify=notify)
@@ -1014,10 +1020,24 @@ class PackageInboxManager:
         base_url = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_URL))
         tracking_code = _clean_optional(record.get("tracking_code"))
         carrier = _carrier_slug(record.get("carrier"))
-        if not base_url or not tracking_code or carrier not in {"fedex"}:
+        if not base_url or not tracking_code or carrier not in TRACKING_SCRAPER_CARRIERS:
             return None
 
         endpoint = urljoin(base_url.rstrip("/") + "/", "track")
+        tracking_url = record.get("tracking_url") or build_tracking_url(
+            carrier,
+            tracking_code,
+            delivery_postcode=self.config.get(CONF_DELIVERY_POSTCODE),
+            delivery_house_number=self.config.get(CONF_DELIVERY_HOUSE_NUMBER),
+        )
+        payload = {
+            "carrier": carrier,
+            "tracking_code": tracking_code,
+            "tracking_url": tracking_url,
+            "package_key": record.get("key"),
+            "delivery_postcode": self.config.get(CONF_DELIVERY_POSTCODE),
+            "delivery_house_number": self.config.get(CONF_DELIVERY_HOUSE_NUMBER),
+        }
         session = async_get_clientsession(self.hass)
         timeout = ClientTimeout(total=int(self.config[CONF_TRACKING_TIMEOUT]))
         headers = {
@@ -1031,12 +1051,7 @@ class PackageInboxManager:
         try:
             async with session.post(
                 endpoint,
-                json={
-                    "carrier": carrier,
-                    "tracking_code": tracking_code,
-                    "tracking_url": record.get("tracking_url")
-                    or build_tracking_url(carrier, tracking_code),
-                },
+                json=payload,
                 headers=headers,
                 timeout=timeout,
             ) as response:
@@ -1053,7 +1068,7 @@ class PackageInboxManager:
                     payload,
                     carrier=carrier,
                     tracking_code=tracking_code,
-                    tracking_url=record.get("tracking_url"),
+                    tracking_url=tracking_url,
                     today=dt_util.now().date(),
                 )
                 if update:
@@ -2029,6 +2044,7 @@ def _merge_tracking_update(
     checked_at: str,
 ) -> dict[str, Any]:
     merged = dict(record)
+    carrier = _carrier_slug(record.get("carrier") or update.get("carrier"))
     for key, value in update.items():
         if value is None:
             continue
@@ -2046,10 +2062,23 @@ def _merge_tracking_update(
 
     merged["tracking_last_checked"] = checked_at
     merged["tracking_refresh_has_delivery_detail"] = _tracking_update_has_delivery_detail(update)
+    if (
+        carrier == "chronopost"
+        and update.get("status") in (STATUS_IN_TRANSIT, STATUS_EXPECTED_TODAY, STATUS_DELIVERED)
+        and not update.get("pickup_location")
+    ):
+        merged["pickup_location"] = None
+        merged["pickup_code"] = None
+    if carrier == "chronopost" and update.get("status") == STATUS_IN_TRANSIT:
+        merged["expected_date"] = None
+        merged["delivery_window_start"] = None
+        merged["delivery_window_end"] = None
     if merged.get("status") in (STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"):
         merged["expected_date"] = None
         merged["delivery_window_start"] = None
         merged["delivery_window_end"] = None
+        merged["pickup_location"] = None
+        merged["pickup_code"] = None
     elif merged.get("status") == STATUS_READY_FOR_PICKUP:
         merged["delivery_window_start"] = None
         merged["delivery_window_end"] = None

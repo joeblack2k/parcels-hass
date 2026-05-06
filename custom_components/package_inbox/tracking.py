@@ -249,15 +249,83 @@ def normalize_tracking_scraper_update(
         update["tracking_status_text"] = status_text[:220]
 
     update["status"] = _status_from_scraper_payload(payload.get("status"), raw_status, expected_date, today)
+    chronopost_pickup_ready = carrier_slug == "chronopost" and _chronopost_payload_has_pickup_ready_signal(
+        f"{raw_status} {status_text}"
+    )
+    if carrier_slug == "chronopost" and update.get("status") == STATUS_IN_TRANSIT:
+        update.pop("expected_date", None)
+        update.pop("delivery_window_start", None)
+        update.pop("delivery_window_end", None)
+
+    pickup_location = clean_text(
+        str(payload.get("pickup_location") or payload.get("pickup_point") or payload.get("collection_point") or "")
+    )
+    if carrier_slug == "chronopost" and _looks_like_chronopost_placeholder_pickup(pickup_location):
+        pickup_location = ""
+    if (
+        carrier_slug == "chronopost"
+        and pickup_location
+        and update.get("status") in (STATUS_IN_TRANSIT, STATUS_EXPECTED_TODAY)
+    ):
+        pickup_location = ""
+    if carrier_slug == "chronopost" and pickup_location and update.get("status") == STATUS_DELIVERED:
+        if chronopost_pickup_ready:
+            update["status"] = STATUS_READY_FOR_PICKUP
+            update["tracking_status_text"] = f"Afhalen bij {pickup_location}"[:220]
+        else:
+            pickup_location = ""
 
     location = clean_text(str(payload.get("location") or ""))
     if location and update.get("tracking_status_text") and location.lower() not in str(update["tracking_status_text"]).lower():
         update["tracking_status_text"] = f"{update['tracking_status_text']} - {location}"[:220]
 
+    if pickup_location:
+        update["pickup_location"] = pickup_location
+        if update.get("status") == STATUS_UNKNOWN:
+            update["status"] = STATUS_READY_FOR_PICKUP
+
+    pickup_code = clean_text(str(payload.get("pickup_code") or payload.get("collection_code") or ""))
+    if pickup_code:
+        update["pickup_code"] = pickup_code
+
     events = payload.get("events")
     if isinstance(events, list) and events:
         update["extra"] = {"tracking_events": events[:20]}
     return update
+
+
+def _looks_like_chronopost_placeholder_pickup(value: str | None) -> bool:
+    folded = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    if not folded:
+        return False
+    if folded in {"normal", "pickup", "pick up point", "point relais", "chronopost relais point"}:
+        return True
+    if re.match(r"^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", folded):
+        return True
+    if re.match(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b", folded):
+        return True
+    return bool(re.match(r"^\d{1,2}[/-]\d{1,2}[/-]20\d{2}\b", folded))
+
+
+def _chronopost_payload_has_pickup_ready_signal(value: str | None) -> bool:
+    lowered = _strip_accents(clean_text(str(value or ""))).lower()
+    return any(
+        term in lowered
+        for term in (
+            "ready for pickup",
+            "available at pickup point",
+            "available at pick up point",
+            "delivered at pickup point",
+            "delivered to pickup point",
+            "disponible au point",
+            "mis a disposition",
+            "a retirer",
+            "livre au point relais",
+            "livre en point relais",
+            "livre dans un point relais",
+            "livre a un point relais",
+        )
+    )
 
 
 def _tracking_query(values: dict[str, str | None]) -> str:
@@ -1128,3 +1196,28 @@ def _status_excerpt(value: str, carrier: str) -> str | None:
         if 12 <= len(cleaned) <= 220 and any(keyword in cleaned.lower() for keyword in keywords):
             return cleaned[:220]
     return value[:220] if value else None
+
+
+def _strip_accents(value: str) -> str:
+    return (
+        value.replace("é", "e")
+        .replace("è", "e")
+        .replace("ê", "e")
+        .replace("ë", "e")
+        .replace("à", "a")
+        .replace("â", "a")
+        .replace("ä", "a")
+        .replace("î", "i")
+        .replace("ï", "i")
+        .replace("ô", "o")
+        .replace("ö", "o")
+        .replace("ù", "u")
+        .replace("û", "u")
+        .replace("ü", "u")
+        .replace("ç", "c")
+        .replace("É", "E")
+        .replace("È", "E")
+        .replace("Ê", "E")
+        .replace("À", "A")
+        .replace("Ç", "C")
+    )

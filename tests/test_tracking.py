@@ -418,3 +418,84 @@ def test_normalizes_local_tracking_scraper_out_for_delivery_response():
     assert update["status"] == "expected_today"
     assert update["delivery_window_start"] == "12:10"
     assert update["delivery_window_end"] == "14:10"
+
+
+def test_normalizes_local_tracking_scraper_pickup_response():
+    update = normalize_tracking_scraper_update(
+        {
+            "carrier": "chronopost",
+            "tracking_code": "XU152297803JF",
+            "status": "ready_for_pickup",
+            "tracking_status_text": "Afhalen bij HEMA LEIDSCHENDAM",
+            "pickup_location": "HEMA LEIDSCHENDAM",
+            "pickup_code": "1480",
+        },
+        carrier="chronopost",
+        tracking_code="XU152297803JF",
+        today=date(2026, 5, 6),
+    )
+
+    assert update is not None
+    assert update["status"] == "ready_for_pickup"
+    assert update["pickup_location"] == "HEMA LEIDSCHENDAM"
+    assert update["pickup_code"] == "1480"
+
+
+def test_normalizes_chronopost_sidecar_placeholder_pickup_as_delivered_without_pickup():
+    update = normalize_tracking_scraper_update(
+        {
+            "carrier": "chronopost",
+            "tracking_code": "XU152297803JF",
+            "status": "delivered",
+            "tracking_status_text": "Livré",
+            "pickup_location": "samedi 02/05/2026, 16:15 NOGENT SUR OISE - FR - KALTEL",
+        },
+        carrier="chronopost",
+        tracking_code="XU152297803JF",
+        today=date(2026, 5, 6),
+    )
+
+    assert update is not None
+    assert update["status"] == "delivered"
+    assert "pickup_location" not in update
+
+
+def test_normalizes_chronopost_sidecar_pickup_location_does_not_override_delivered_status():
+    update = normalize_tracking_scraper_update(
+        {
+            "carrier": "chronopost",
+            "tracking_code": "XU152297803JF",
+            "status": "delivered",
+            "tracking_status_text": "Livré",
+            "pickup_location": "DROOMVISIE - SCHOOLSTRAAT 109A - 2251 BG - VOORSCHOTEN - NL",
+        },
+        carrier="chronopost",
+        tracking_code="XU152297803JF",
+        today=date(2026, 5, 6),
+    )
+
+    assert update is not None
+    assert update["status"] == "delivered"
+    assert "pickup_location" not in update
+
+
+def test_normalizes_chronopost_sidecar_in_transit_clears_pickup_destination():
+    update = normalize_tracking_scraper_update(
+        {
+            "carrier": "chronopost",
+            "tracking_code": "XU152297803JF",
+            "status": "in_transit",
+            "expected_date": "2026-05-05",
+            "tracking_status_text": "Shipment in transit - HUB CHILLY MAZARIN CHRONOPOST",
+            "pickup_location": "DROOMVISIE - SCHOOLSTRAAT 109A - 2251 BG - VOORSCHOTEN - NL",
+        },
+        carrier="chronopost",
+        tracking_code="XU152297803JF",
+        today=date(2026, 5, 6),
+    )
+
+    assert update is not None
+    assert update["status"] == "in_transit"
+    assert update["tracking_status_text"] == "Shipment in transit - HUB CHILLY MAZARIN CHRONOPOST"
+    assert "expected_date" not in update
+    assert "pickup_location" not in update

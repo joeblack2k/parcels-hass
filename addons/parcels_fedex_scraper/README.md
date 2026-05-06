@@ -1,10 +1,16 @@
-# Parcels FedEx Scraper
+# Parcels Tracking Scraper
 
-Experimental Home Assistant OS app/add-on for personal FedEx tracking refreshes in Parcels for Home Assistant.
+Experimental Home Assistant OS app/add-on for personal tracking refreshes in Parcels for Home Assistant.
 
-FedEx can block normal server-side HTTP tracking with Akamai permission pages. This app runs a local Playwright browser inside Home Assistant OS, opens FedEx tracking locally, captures FedEx tracking JSON when available, and returns only normalized parcel status to the `package_inbox` integration.
+Some carriers block normal server-side HTTP tracking or render the useful details in the browser. This app runs a local Playwright browser inside Home Assistant OS, opens the tracking page locally, captures tracking JSON when available, and returns only normalized parcel status to the `package_inbox` integration.
 
-It does not send FedEx cookies, raw HTML, browser storage, or account tokens back to Home Assistant.
+It does not send carrier cookies, raw HTML, browser storage, or account tokens back to Home Assistant.
+
+Supported carriers:
+
+- FedEx
+- Chronopost
+- Vinted login/session refresh (experimental; tracking enrichment follows later)
 
 ## Options
 
@@ -12,7 +18,30 @@ It does not send FedEx cookies, raw HTML, browser storage, or account tokens bac
 | --- | --- | --- |
 | `scraper_token` | not set | Optional bearer token expected from the integration. Use this if you expose the port. |
 | `headless` | `true` | Runs Chromium headless. |
-| `timeout` | `45` | FedEx page/API wait timeout in seconds. |
+| `timeout` | `45` | Browser request timeout in seconds. |
+| `vinted_auto_login` | `false` | Periodically refreshes a Vinted browser session when credentials are configured. |
+| `vinted_login_on_start` | `true` | Runs one Vinted login refresh when the add-on starts. |
+| `vinted_login_interval_hours` | `22` | Delay between automatic Vinted login refreshes. |
+| `vinted_email` | not set | Vinted account e-mail; keep this local in the add-on options. |
+| `vinted_password` | not set | Vinted password; stored by Home Assistant as a password option. |
+
+## Vinted Auto Login
+
+Vinted sessions can expire quickly. When `vinted_auto_login` is enabled and
+credentials are present, the add-on opens a persistent Chromium profile under
+`/data/browser-profiles/vinted`, submits the Vinted login form, stores only the
+result status, and closes the browser context again. It does not try to bypass
+captcha, two-factor prompts, suspicious-login checks, or account challenges; it
+returns a clear status such as `captcha_required`, `two_factor_required`, or
+`login_required`.
+
+Useful endpoints:
+
+- `GET /login/vinted/status`
+- `POST /login/vinted`
+
+Both endpoints are protected by `scraper_token` when you configure one. Keep
+this add-on on your LAN and do not expose it to the public internet.
 
 ## Home Assistant YAML
 

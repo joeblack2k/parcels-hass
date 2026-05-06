@@ -1,7 +1,7 @@
-name: Parcels FedEx Scraper
-version: "0.1.0"
+name: Parcels Tracking Scraper
+version: "0.1.2"
 slug: parcels_fedex_scraper
-description: Experimental local FedEx tracking scraper for Parcels for Home Assistant.
+description: Experimental local tracking scraper for Parcels for Home Assistant.
 url: https://github.com/joeblack2k/parcels-hass/tree/main/addons/parcels_fedex_scraper
 arch:
   - amd64
@@ -17,7 +17,15 @@ watchdog: http://[HOST]:[PORT:8765]/health
 options:
   headless: true
   timeout: 45
+  vinted_auto_login: false
+  vinted_login_on_start: true
+  vinted_login_interval_hours: 22
 schema:
   scraper_token: password?
   headless: bool
   timeout: int(10,90)
+  vinted_auto_login: bool
+  vinted_login_on_start: bool
+  vinted_login_interval_hours: int(1,168)
+  vinted_email: str?
+  vinted_password: password?
