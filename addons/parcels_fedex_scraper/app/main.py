@@ -68,14 +68,13 @@ VINTED_STATUS_KEYWORDS = {
     "ready_for_pickup": (
         "ready for pickup",
         "ready to pick up",
-        "pickup point",
-        "collection point",
+        "available for pickup",
         "ligt klaar",
         "klaar om op te halen",
         "op te halen",
-        "afhaalpunt",
-        "pakketpunt",
-        "parcel shop",
+        "afhaalcode",
+        "ophaalcode",
+        "pickup code",
     ),
     "picked_up": (
         "picked up",
@@ -2526,8 +2525,6 @@ def vinted_record_from_api_package(
     pickup_location = vinted_as_str(package.get("pickup_point"))
     if pickup_code and status in {"unknown", "in_transit", "expected_today"}:
         status = "ready_for_pickup"
-    if pickup_location and status == "unknown":
-        status = "ready_for_pickup"
 
     carrier_reference = vinted_carrier_tracking_from_values(
         carrier=vinted_as_str(package.get("carrier")),
@@ -2783,8 +2780,6 @@ def vinted_record_from_text(
 
     if pickup_code and status in {"unknown", "in_transit", "expected_today"}:
         status = "ready_for_pickup"
-    if pickup_location and status == "unknown":
-        status = "ready_for_pickup"
     if status == "unknown" and not carrier_reference and not expected_date and not pickup_code and not pickup_location:
         return None
 
@@ -2867,9 +2862,6 @@ def vinted_status_from_text(folded: str) -> str:
             "afhaalcode",
             "ophaalcode",
             "pickup code",
-            "pakketpunt",
-            "pickup point",
-            "point relais",
             "qr-code om je pakket op te halen",
             "qr code to pick up",
         )

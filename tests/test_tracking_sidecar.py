@@ -146,6 +146,20 @@ def test_vinted_text_can_correct_stale_pickup_to_in_transit():
     assert record["extra"]["carrier_tracking"]["carrier"] == "chronopost"
 
 
+def test_vinted_text_does_not_treat_pickup_point_destination_as_ready():
+    record = vinted_record_from_text(
+        "Vinted pakket. Pickup point: DROOMVISIE Schoolstraat 109A Voorschoten. "
+        "Chronopost tracking XU152297803JF.",
+        account_key="account_1",
+        source_url="https://www.vinted.nl/inbox/789",
+    )
+
+    assert record is not None
+    assert record["status"] == "unknown"
+    assert "pickup_location" not in record
+    assert record["extra"]["carrier_tracking"]["carrier"] == "chronopost"
+
+
 def test_vinted_json_records_are_normalized_and_deduped():
     records = vinted_records_from_json(
         {

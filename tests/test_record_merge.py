@@ -47,7 +47,7 @@ def test_vinted_cross_reference_promotes_record_to_carrier_key_shape():
     assert record["extra"]["vinted_cross_reference"]["status"] == "ready_for_pickup"
 
 
-def test_vinted_cross_reference_overrides_existing_weaker_chronopost_record():
+def test_vinted_cross_reference_does_not_override_carrier_in_transit_with_pickup_destination():
     existing = {
         "key": "chronopost:xu152297803jf",
         "carrier": "chronopost",
@@ -77,13 +77,13 @@ def test_vinted_cross_reference_overrides_existing_weaker_chronopost_record():
     record = apply_vinted_cross_reference(vinted, {"chronopost:xu152297803jf": existing})
 
     assert record["carrier"] == "chronopost"
-    assert record["status"] == "ready_for_pickup"
-    assert record["pickup_location"] == "DROOMVISIE - SCHOOLSTRAAT 109A - VOORSCHOTEN"
+    assert record["status"] == "in_transit"
+    assert "pickup_location" not in record
     assert record["shop"] == "Vinted"
     assert record["source"] == "vinted_cross_reference"
 
 
-def test_weak_chronopost_refresh_preserves_vinted_pickup_state():
+def test_chronopost_in_transit_refresh_clears_stale_vinted_pickup_cross_reference():
     merged = merge_tracking_update(
         {
             "carrier": "chronopost",
@@ -105,11 +105,11 @@ def test_weak_chronopost_refresh_preserves_vinted_pickup_state():
         "2026-05-06T14:00:14+02:00",
     )
 
-    assert merged["status"] == "ready_for_pickup"
-    assert merged["pickup_location"] == "DROOMVISIE - SCHOOLSTRAAT 109A - VOORSCHOTEN"
+    assert merged["status"] == "in_transit"
+    assert merged["pickup_location"] is None
     assert merged["source"] == "vinted_cross_reference"
     assert merged["tracking_refresh_source"] == "ai_tracking_page"
-    assert merged["tracking_refresh_has_delivery_detail"] is False
+    assert merged["tracking_refresh_has_delivery_detail"] is True
 
 
 def test_existing_carrier_record_with_vinted_reference_keeps_new_refresh_diagnostics():
@@ -179,8 +179,8 @@ def test_later_carrier_record_links_back_to_stored_vinted_reference():
     )
 
     assert record["carrier"] == "chronopost"
-    assert record["status"] == "ready_for_pickup"
-    assert record["pickup_location"] == "DROOMVISIE - SCHOOLSTRAAT 109A - VOORSCHOTEN"
+    assert record["status"] == "in_transit"
+    assert "pickup_location" not in record
     assert record["extra"]["vinted_cross_reference"]["key"] == "vinted:5artikelenno"
 
 
