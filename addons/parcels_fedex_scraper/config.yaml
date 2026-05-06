@@ -1,5 +1,5 @@
 name: Parcels Tracking Scraper
-version: "0.1.5"
+version: "0.1.6"
 slug: parcels_fedex_scraper
 description: Experimental local tracking scraper for Parcels for Home Assistant.
 url: https://github.com/joeblack2k/parcels-hass/tree/main/addons/parcels_fedex_scraper

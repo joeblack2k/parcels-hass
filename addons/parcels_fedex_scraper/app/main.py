@@ -2469,8 +2469,12 @@ def vinted_package_from_conversation(
             ),
         )
     )
+    expected_from, expected_to = vinted_expected_delivery_range(combined, text)
+    tracking_events = vinted_extract_tracking_events(combined, text)
     item_title = vinted_extract_item_title(combined)
+    item_title = item_title or vinted_item_title_from_text(text)
     other_party = vinted_extract_other_party(combined)
+    other_party = other_party or vinted_other_party_from_text(text)
     last_update = vinted_as_str(
         vinted_first_by_keys(
             combined,
@@ -2508,6 +2512,9 @@ def vinted_package_from_conversation(
         "pickup_point": pickup_point,
         "pickup_deadline": date_from_any(pickup_deadline) or pickup_deadline,
         "pickup_code": re.sub(r"[^A-Z0-9]", "", pickup_code.upper()) if pickup_code else None,
+        "expected_date": expected_from,
+        "expected_date_to": expected_to,
+        "tracking_events": tracking_events,
         "last_update": last_update,
         "source_confidence": "structured" if structured_status or transaction or shipment else "text",
         "raw_text": text[:600],
@@ -2540,6 +2547,8 @@ def vinted_record_from_api_package(
     if status == "unknown" and not any((carrier_reference, pickup_code, pickup_location)):
         return None
 
+    expected_date = vinted_as_str(package.get("expected_date"))
+    expected_date_to = vinted_as_str(package.get("expected_date_to"))
     record: dict[str, Any] = {
         "carrier": "vinted",
         "shop": "Vinted",
@@ -2558,6 +2567,14 @@ def vinted_record_from_api_package(
             "vinted_source_confidence": package.get("source_confidence") or "unknown",
         },
     }
+    if expected_date and status not in {"ready_for_pickup", "picked_up", "delivered", "cancelled"}:
+        record["expected_date"] = expected_date
+    if expected_date_to:
+        record["extra"]["expected_date_end"] = expected_date_to
+        record["extra"]["vinted_expected_date_to"] = expected_date_to
+    tracking_events = package.get("tracking_events")
+    if isinstance(tracking_events, list) and tracking_events:
+        record["extra"]["tracking_events"] = tracking_events[:10]
     for extra_key in ("thread_id", "item_title", "other_party", "last_update"):
         if package.get(extra_key):
             record["extra"][f"vinted_{extra_key}"] = package[extra_key]
@@ -2614,6 +2631,278 @@ def vinted_as_str(value: Any) -> str | None:
     return None
 
 
+VINTED_MONTHS = {
+    "januari": 1,
+    "jan": 1,
+    "january": 1,
+    "februari": 2,
+    "feb": 2,
+    "february": 2,
+    "maart": 3,
+    "mrt": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "mei": 5,
+    "may": 5,
+    "juni": 6,
+    "jun": 6,
+    "june": 6,
+    "juli": 7,
+    "jul": 7,
+    "july": 7,
+    "augustus": 8,
+    "aug": 8,
+    "august": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "oktober": 10,
+    "okt": 10,
+    "oct": 10,
+    "october": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
+
+def vinted_expected_delivery_range(node: Any, text: str) -> tuple[str, str]:
+    start = vinted_date_from_any(
+        vinted_first_by_keys(
+            node,
+            (
+                "expected_delivery_from",
+                "expected_delivery_start",
+                "estimated_delivery_from",
+                "estimated_delivery_start",
+                "delivery_from",
+                "delivery_start",
+                "min_delivery_date",
+                "expected_from",
+                "from_date",
+            ),
+        )
+    )
+    end = vinted_date_from_any(
+        vinted_first_by_keys(
+            node,
+            (
+                "expected_delivery_to",
+                "expected_delivery_end",
+                "estimated_delivery_to",
+                "estimated_delivery_end",
+                "delivery_to",
+                "delivery_end",
+                "max_delivery_date",
+                "expected_to",
+                "to_date",
+            ),
+        )
+    )
+    if start or end:
+        return (start or end, end or start)
+
+    return vinted_date_range_from_text(text)
+
+
+def vinted_date_from_any(value: Any) -> str:
+    iso = date_from_any(value)
+    if iso:
+        return iso
+    text = fold_text(str(value or ""))
+    year = vinted_context_year(text)
+    month_names = "|".join(sorted(map(re.escape, VINTED_MONTHS), key=len, reverse=True))
+    for pattern in (
+        rf"\b(?P<month>{month_names})\s+(?P<day>\d{{1,2}})(?:,\s*(?P<year>20\d{{2}}))?\b",
+        rf"\b(?P<day>\d{{1,2}})\s+(?P<month>{month_names})(?:\s+(?P<year>20\d{{2}}))?\b",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return vinted_iso_date(
+                int(match.group("day")),
+                VINTED_MONTHS[match.group("month")],
+                int(match.group("year") or year),
+            )
+    return ""
+
+
+def vinted_date_range_from_text(text: str) -> tuple[str, str]:
+    folded = fold_text(text)
+    match = re.search(r"(verwachte levertijd|verwachte bezorging|expected delivery|estimated delivery)[:\s]+(.{0,90})", folded)
+    candidates = [match.group(2)] if match else []
+    candidates.append(folded)
+    year = vinted_context_year(folded)
+    month_names = "|".join(sorted(map(re.escape, VINTED_MONTHS), key=len, reverse=True))
+
+    for candidate in candidates:
+        for pattern in (
+            rf"\b(?P<m1>{month_names})\s+(?P<d1>\d{{1,2}})\s*(?:-|–|—|t/m|tot)\s*(?:(?P<m2>{month_names})\s+)?(?P<d2>\d{{1,2}})(?:,?\s*(?P<year>20\d{{2}}))?\b",
+            rf"\b(?P<d1>\d{{1,2}})\s+(?P<m1>{month_names})\s*(?:-|–|—|t/m|tot)\s*(?P<d2>\d{{1,2}})(?:\s+(?P<m2>{month_names}))?(?:\s+(?P<year>20\d{{2}}))?\b",
+        ):
+            range_match = re.search(pattern, candidate)
+            if not range_match:
+                continue
+            used_year = int(range_match.group("year") or year)
+            start_month = VINTED_MONTHS[range_match.group("m1")]
+            end_month = VINTED_MONTHS[range_match.group("m2") or range_match.group("m1")]
+            start = vinted_iso_date(int(range_match.group("d1")), start_month, used_year)
+            end = vinted_iso_date(int(range_match.group("d2")), end_month, used_year)
+            if start and end:
+                return (start, end)
+
+        single = vinted_date_from_any(candidate)
+        if single and match:
+            return (single, single)
+    return ("", "")
+
+
+def vinted_context_year(text: str) -> int:
+    match = re.search(r"\b(20\d{2})\b", str(text or ""))
+    return int(match.group(1)) if match else datetime.now().year
+
+
+def vinted_iso_date(day: int, month: int, year: int) -> str:
+    try:
+        return datetime(year, month, day).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def vinted_extract_tracking_events(node: Any, text: str) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    for candidate in iter_dicts(node):
+        status = vinted_as_str(
+            candidate.get("status_title")
+            or candidate.get("status_text")
+            or candidate.get("tracking_status")
+            or candidate.get("title")
+            or candidate.get("label")
+            or candidate.get("description")
+            or candidate.get("message")
+            or candidate.get("status")
+        )
+        if not status or not vinted_is_tracking_event_status(status):
+            continue
+        timestamp = vinted_datetime_from_any(
+            candidate.get("created_at")
+            or candidate.get("updated_at")
+            or candidate.get("happened_at")
+            or candidate.get("date")
+            or candidate.get("timestamp")
+        )
+        if not timestamp:
+            continue
+        event = {"status": clean_location_piece(status)[:120], "timestamp": timestamp}
+        location = vinted_as_str(candidate.get("location") or candidate.get("place") or candidate.get("city"))
+        if location:
+            event["location"] = clean_location_piece(location)[:120]
+        events.append(event)
+
+    events.extend(vinted_tracking_events_from_text(text))
+    return dedupe_vinted_events(events)[:10]
+
+
+def vinted_datetime_from_any(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(microsecond=0).isoformat()
+    except ValueError:
+        pass
+    match = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2}),?\s+([0-2]?\d)[:.]([0-5]\d)\b", text)
+    if match:
+        return (
+            f"{int(match.group(3)):04d}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
+            f"T{int(match.group(4)):02d}:{match.group(5)}:00"
+        )
+    return ""
+
+
+def vinted_tracking_events_from_text(text: str) -> list[dict[str, str]]:
+    normalized = re.sub(r"\s+", " ", html.unescape(str(text or "")))
+    status_pattern = (
+        r"Onderweg|Verzonden|Trackingcode aangemaakt(?:\s*-\s*[A-Z0-9]{8,40})?|"
+        r"In transit|Shipped|Tracking code created(?:\s*-\s*[A-Z0-9]{8,40})?|"
+        r"Klaar om op te halen|Ready for pickup|Afgeleverd|Delivered"
+    )
+    events: list[dict[str, str]] = []
+    for match in re.finditer(
+        rf"\b({status_pattern})\b\s+(\d{{1,2}}[-/]\d{{1,2}}[-/]20\d{{2}}),?\s+([0-2]?\d[:.][0-5]\d)",
+        normalized,
+        re.IGNORECASE,
+    ):
+        status = clean_location_piece(match.group(1))
+        timestamp = vinted_datetime_from_any(f"{match.group(2)}, {match.group(3)}")
+        if not timestamp:
+            continue
+        event = {"status": vinted_event_status_label(status), "timestamp": timestamp}
+        code_match = re.search(r"\b([A-Z0-9]{8,40})\b", status)
+        if code_match:
+            event["tracking_code"] = code_match.group(1).upper()
+        events.append(event)
+    return events
+
+
+def vinted_event_status_label(value: str) -> str:
+    folded = fold_text(value)
+    if "trackingcode aangemaakt" in folded or "tracking code created" in folded:
+        return "Trackingcode aangemaakt"
+    if "onderweg" in folded or "in transit" in folded:
+        return "Onderweg"
+    if "verzonden" in folded or "shipped" in folded:
+        return "Verzonden"
+    if "klaar" in folded or "ready for pickup" in folded:
+        return "Klaar om op te halen"
+    if "afgeleverd" in folded or "delivered" in folded:
+        return "Afgeleverd"
+    return clean_location_piece(value)[:120]
+
+
+def vinted_is_tracking_event_status(value: str) -> bool:
+    folded = fold_text(value)
+    return any(
+        term in folded
+        for term in (
+            "onderweg",
+            "verzonden",
+            "trackingcode aangemaakt",
+            "tracking code created",
+            "in transit",
+            "shipped",
+            "ready for pickup",
+            "klaar om op te halen",
+            "afgeleverd",
+            "delivered",
+        )
+    )
+
+
+def dedupe_vinted_events(events: list[dict[str, str]]) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        status = clean_location_piece(str(event.get("status") or ""))
+        timestamp = str(event.get("timestamp") or "")
+        if not status or not timestamp:
+            continue
+        key = (fold_text(status), timestamp)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_event = {"status": status[:120], "timestamp": timestamp}
+        for extra_key in ("location", "tracking_code"):
+            value = clean_location_piece(str(event.get(extra_key) or ""))
+            if value:
+                clean_event[extra_key] = value[:120]
+        deduped.append(clean_event)
+    return deduped
+
+
 def vinted_extract_item_title(node: Any) -> str | None:
     if isinstance(node, dict):
         for section in ("transaction", "order", "summary", "conversation"):
@@ -2638,6 +2927,26 @@ def vinted_extract_item_title(node: Any) -> str | None:
     return None
 
 
+def vinted_item_title_from_text(text: str) -> str | None:
+    skip = {
+        "pakket volgen",
+        "aankoop geslaagd",
+        "bestelling verzonden",
+        "trackinginformatie",
+        "trackingnummer",
+        "verzend een bericht",
+    }
+    for line in meaningful_lines(text)[:30]:
+        folded = fold_text(line)
+        if folded in skip or folded.startswith("eur ") or folded.startswith("€"):
+            continue
+        if re.fullmatch(r"\d+\s+(?:artikel|artikelen|item|items)", folded):
+            return clean_location_piece(line)[:120]
+        if 3 <= len(line) <= 120 and "bestelling " in folded:
+            return clean_location_piece(re.sub(r"(?i)\bbestelling\b", "", line)).strip()[:120]
+    return None
+
+
 def vinted_extract_other_party(node: Any) -> str | None:
     for candidate in iter_dicts(node):
         for key in ("other_user", "user", "seller", "buyer"):
@@ -2646,6 +2955,20 @@ def vinted_extract_other_party(node: Any) -> str | None:
                 login = vinted_as_str(user.get("login") or user.get("username") or user.get("name"))
                 if login:
                     return login
+    return None
+
+
+def vinted_other_party_from_text(text: str) -> str | None:
+    match = re.search(r"\b(?:verkoper|seller)\s+([A-Za-z0-9_.-]{3,40})\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    for line in meaningful_lines(text)[:8]:
+        candidate = line.strip()
+        folded = fold_text(candidate)
+        if folded in {"vinted", "pakket volgen", "trackingnummer", "aankoop geslaagd"}:
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{2,39}", candidate):
+            return candidate
     return None
 
 
@@ -2707,11 +3030,22 @@ def vinted_api_status_text(package: dict[str, Any], *, status: str) -> str:
     title = vinted_as_str(package.get("item_title"))
     carrier = vinted_as_str(package.get("carrier"))
     tracking_code = vinted_as_str(package.get("tracking_code"))
-    parts = [title, carrier, tracking_code]
+    expected = vinted_expected_text(package.get("expected_date"), package.get("expected_date_to"))
+    parts = [title, expected, carrier, tracking_code]
     compact = " - ".join(part for part in parts if part)
     if compact:
         return compact[:220]
     return status.replace("_", " ").title()
+
+
+def vinted_expected_text(start: Any, end: Any) -> str:
+    start_text = vinted_as_str(start)
+    end_text = vinted_as_str(end)
+    if start_text and end_text and start_text != end_text:
+        return f"verwacht {start_text} t/m {end_text}"
+    if start_text:
+        return f"verwacht {start_text}"
+    return ""
 
 
 def vinted_records_from_json(
@@ -2775,8 +3109,11 @@ def vinted_record_from_text(
     pickup_code = vinted_pickup_code(text)
     pickup_location = vinted_pickup_location(text) if status == "ready_for_pickup" else ""
     carrier_reference = vinted_carrier_tracking(text)
-    expected_date = date_from_any(text)
+    expected_date, expected_date_to = vinted_expected_delivery_range({}, text)
     deadline = vinted_pickup_deadline(text)
+    item_title = vinted_item_title_from_text(text)
+    other_party = vinted_other_party_from_text(text)
+    tracking_events = vinted_tracking_events_from_text(text)
 
     if pickup_code and status in {"unknown", "in_transit", "expected_today"}:
         status = "ready_for_pickup"
@@ -2806,6 +3143,15 @@ def vinted_record_from_text(
     }
     if expected_date and status not in {"ready_for_pickup", "picked_up", "delivered", "cancelled"}:
         record["expected_date"] = expected_date
+    if expected_date_to:
+        record["extra"]["expected_date_end"] = expected_date_to
+        record["extra"]["vinted_expected_date_to"] = expected_date_to
+    if item_title:
+        record["extra"]["vinted_item_title"] = item_title
+    if other_party:
+        record["extra"]["vinted_other_party"] = other_party
+    if tracking_events:
+        record["extra"]["tracking_events"] = tracking_events[:10]
     if pickup_location:
         record["pickup_location"] = pickup_location
     if pickup_code:

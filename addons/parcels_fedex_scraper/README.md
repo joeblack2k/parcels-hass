@@ -69,7 +69,9 @@ shipment/order pages and browser JSON responses, and returns only normalized
 parcel records. It does not return raw page text, cookies, browser storage, or
 account tokens. When Vinted shows a carrier tracking reference, the response
 keeps `carrier: vinted` and includes `extra.carrier_tracking` so the Home
-Assistant integration can merge Vinted truth into the carrier package key.
+Assistant integration can merge Vinted truth into the carrier package key. For
+richer dashboards it also mirrors safe parcel details such as item title, other
+party username, expected delivery date range, and tracking timeline events.
 
 Both endpoints are protected by `scraper_token` when you configure one. Keep
 this add-on on your LAN and do not expose it to the public internet.

@@ -227,6 +227,92 @@ def test_vinted_api_conversation_extracts_structured_chronopost_pickup():
     assert record["extra"]["vinted_thread_id"] == "77"
 
 
+def test_vinted_api_conversation_extracts_product_eta_range_and_timeline():
+    package = vinted_package_from_conversation(
+        {"id": 99, "last_message_at": "2026-05-06T14:50:00Z"},
+        {
+            "conversation": {
+                "id": 99,
+                "other_user": {"login": "bruijna1981"},
+                "transaction": {
+                    "id": 19631936553,
+                    "shipment": {
+                        "id": 1778051829299958,
+                        "tracking_status": "in transit",
+                        "tracking_code": "1778051829299958",
+                        "expected_delivery_from": "2026-05-11",
+                        "expected_delivery_to": "2026-05-13",
+                        "events": [
+                            {"title": "Onderweg", "created_at": "2026-05-06T14:49:00+02:00"},
+                            {"title": "Verzonden", "created_at": "2026-05-06T10:10:00+02:00"},
+                            {
+                                "title": "Trackingcode aangemaakt",
+                                "created_at": "2026-05-06T09:17:00+02:00",
+                            },
+                        ],
+                    },
+                    "item": {"title": "5 artikelen"},
+                },
+            }
+        },
+    )
+
+    assert package is not None
+    assert package["status"] == "in_transit"
+    assert package["item_title"] == "5 artikelen"
+    assert package["other_party"] == "bruijna1981"
+    assert package["expected_date"] == "2026-05-11"
+    assert package["expected_date_to"] == "2026-05-13"
+    assert package["tracking_events"][0]["status"] == "Onderweg"
+
+    record = vinted_record_from_api_package(
+        package,
+        account_key="account_2",
+        source_url="https://www.vinted.nl/inbox/99",
+    )
+
+    assert record is not None
+    assert record["tracking_code"] == "1778051829299958"
+    assert record["expected_date"] == "2026-05-11"
+    assert record["tracking_status_text"].startswith("5 artikelen - verwacht 2026-05-11")
+    assert record["extra"]["vinted_item_title"] == "5 artikelen"
+    assert record["extra"]["vinted_other_party"] == "bruijna1981"
+    assert record["extra"]["expected_date_end"] == "2026-05-13"
+    assert record["extra"]["tracking_events"][0]["timestamp"] == "2026-05-06T14:49:00+02:00"
+
+
+def test_vinted_text_extracts_app_visible_product_eta_and_events():
+    record = vinted_record_from_text(
+        """
+        bruijna1981
+        5 artikelen
+        15,60
+        Bestelling verzonden.
+        Je bestelling is onderweg! Verwachte levertijd: mei 11 - mei 13
+        Pakket volgen
+        Trackingnummer 1778051829299958
+        Onderweg 06-05-2026, 14:49
+        Verzonden 06-05-2026, 10:10
+        Trackingcode aangemaakt - 1778051829299958 06-05-2026, 09:17
+        """,
+        account_key="account_1",
+        source_url="https://www.vinted.nl/inbox/99",
+    )
+
+    assert record is not None
+    assert record["status"] == "in_transit"
+    assert record["tracking_code"] == "1778051829299958"
+    assert record["expected_date"] == "2026-05-11"
+    assert record["extra"]["expected_date_end"] == "2026-05-13"
+    assert record["extra"]["vinted_item_title"] == "5 artikelen"
+    assert record["extra"]["vinted_other_party"] == "bruijna1981"
+    assert [event["status"] for event in record["extra"]["tracking_events"]] == [
+        "Onderweg",
+        "Verzonden",
+        "Trackingcode aangemaakt",
+    ]
+
+
 def test_vinted_api_conversation_can_downgrade_to_in_transit():
     package = vinted_package_from_conversation(
         {"id": 88},

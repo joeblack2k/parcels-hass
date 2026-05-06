@@ -152,3 +152,39 @@ def test_dashboard_labels_vinted_cross_reference_as_vinted():
     assert snapshot["counts"]["pickup"] == 1
     assert snapshot["active"][0]["display_title"] == "Vinted"
     assert snapshot["active"][0]["display_subtitle"] == "Vinted afhalen bij DROOMVISIE"
+
+
+def test_dashboard_exposes_vinted_product_eta_range_and_events():
+    snapshot = build_dashboard_snapshot(
+        [
+            {
+                "key": "vinted:1778051829299958",
+                "carrier": "vinted",
+                "shop": "Vinted",
+                "tracking_code": "1778051829299958",
+                "status": "in_transit",
+                "expected_date": "2026-05-11",
+                "source": "vinted_sidecar",
+                "extra": {
+                    "vinted_item_title": "5 artikelen",
+                    "vinted_other_party": "bruijna1981",
+                    "expected_date_end": "2026-05-13",
+                    "tracking_events": [
+                        {"status": "Onderweg", "timestamp": "2026-05-06T14:49:00+02:00"},
+                        {"status": "Verzonden", "timestamp": "2026-05-06T10:10:00+02:00"},
+                    ],
+                },
+            }
+        ],
+        now=datetime(2026, 5, 6, 22, 10, tzinfo=TZ),
+    )
+
+    record = snapshot["active"][0]
+    assert record["display_title"] == "5 artikelen"
+    assert record["display_subtitle"] == "Vinted - via bruijna1981 - verwacht 11-13 mei"
+    assert record["parcel_title"] == "5 artikelen"
+    assert record["vinted_other_party"] == "bruijna1981"
+    assert record["expected_date"] == "2026-05-11"
+    assert record["expected_date_end"] == "2026-05-13"
+    assert record["expected_date_label"] == "11-13 mei"
+    assert record["tracking_events"][0]["status"] == "Onderweg"

@@ -1991,7 +1991,9 @@ def _record_has_vinted_source(record: dict[str, Any]) -> bool:
 
 def _notification_package_title(record: dict[str, Any]) -> str:
     if _record_has_vinted_source(record):
-        return "Vinted"
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        title = clean_text(str(extra.get("vinted_item_title") or record.get("item_title") or ""))
+        return title or "Vinted"
     shop = clean_text(str(record.get("shop") or ""))
     if shop:
         return shop

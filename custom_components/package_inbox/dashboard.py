@@ -15,6 +15,20 @@ from .const import (
 )
 
 TERMINAL_STATUSES = {STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"}
+_MONTHS_NL = {
+    1: "jan",
+    2: "feb",
+    3: "mrt",
+    4: "apr",
+    5: "mei",
+    6: "jun",
+    7: "jul",
+    8: "aug",
+    9: "sep",
+    10: "okt",
+    11: "nov",
+    12: "dec",
+}
 
 
 def build_dashboard_snapshot(
@@ -135,6 +149,7 @@ def _record_score(record: dict[str, Any]) -> tuple[int, int, float]:
             "pickup_location",
             "pickup_code",
             "qr_file_path",
+            "extra",
         )
         if record.get(key)
     )
@@ -171,6 +186,9 @@ def _public_dashboard_record(record: dict[str, Any], *, today: str) -> dict[str,
     carrier = str(record.get("carrier") or "unknown")
     shop = record.get("shop") or _carrier_title(carrier)
     window_start, window_end = _valid_window_values(record)
+    item_title = _parcel_title(record)
+    other_party = _parcel_other_party(record)
+    expected_date_end = _expected_date_end(record)
     return {
         "key": record.get("key"),
         "carrier": carrier,
@@ -179,6 +197,8 @@ def _public_dashboard_record(record: dict[str, Any], *, today: str) -> dict[str,
         "status": status,
         "status_label": _status_label(status),
         "expected_date": record.get("expected_date"),
+        "expected_date_end": expected_date_end,
+        "expected_date_label": _expected_date_label(record),
         "delivery_window_start": window_start,
         "delivery_window_end": window_end,
         "pickup_location": record.get("pickup_location"),
@@ -188,6 +208,7 @@ def _public_dashboard_record(record: dict[str, Any], *, today: str) -> dict[str,
         "tracking_code": record.get("tracking_code"),
         "tracking_url": record.get("tracking_url"),
         "tracking_status_text": record.get("tracking_status_text"),
+        "tracking_events": _tracking_events(record),
         "tracking_last_checked": record.get("tracking_last_checked"),
         "tracking_refresh_url": record.get("tracking_refresh_url"),
         "tracking_refresh_source": record.get("tracking_refresh_source"),
@@ -200,11 +221,22 @@ def _public_dashboard_record(record: dict[str, Any], *, today: str) -> dict[str,
         "imap_uid": record.get("imap_uid"),
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
+        "parcel_title": item_title,
+        "item_title": item_title,
+        "other_party": other_party,
+        "vinted_other_party": other_party if _is_vinted_record(record) else None,
         "is_terminal": status in TERMINAL_STATUSES,
         "due_today": _record_due_today(record, today=today),
-        "display_title": shop,
+        "display_title": _display_title(record, shop),
         "display_subtitle": _display_subtitle(record),
     }
+
+
+def _display_title(record: dict[str, Any], fallback: Any) -> str:
+    title = _parcel_title(record)
+    if _is_vinted_record(record) and title:
+        return title
+    return str(fallback or _carrier_title(record.get("carrier")))
 
 
 def _display_subtitle(record: dict[str, Any]) -> str:
@@ -216,6 +248,19 @@ def _display_subtitle(record: dict[str, Any]) -> str:
 
     expected_date = record.get("expected_date")
     start, end = _valid_window_values(record)
+    if _is_vinted_record(record):
+        parts = [carrier]
+        other_party = _parcel_other_party(record)
+        expected = _expected_date_label(record)
+        if other_party:
+            parts.append(f"via {other_party}")
+        if expected:
+            parts.append(f"verwacht {expected}")
+        elif record.get("tracking_status_text"):
+            parts.append(str(record["tracking_status_text"]))
+        elif status != STATUS_UNKNOWN:
+            parts.append(_status_label(status))
+        return " - ".join(parts)
     if expected_date and start and end:
         return f"{carrier} {expected_date} {start}-{end}"
     if expected_date:
@@ -230,6 +275,131 @@ def _display_carrier_title(record: dict[str, Any]) -> str:
     if shop.lower() == "vinted" or source.startswith("vinted") or extra.get("vinted_cross_reference"):
         return "Vinted"
     return _carrier_title(record.get("carrier"))
+
+
+def _is_vinted_record(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    shop = str(record.get("shop") or "").lower()
+    source = str(record.get("source") or "").lower()
+    return (
+        str(record.get("carrier") or "").lower() == "vinted"
+        or shop == "vinted"
+        or source.startswith("vinted")
+        or bool(extra.get("vinted_cross_reference"))
+        or bool(extra.get("vinted_item_title"))
+    )
+
+
+def _parcel_title(record: dict[str, Any]) -> str | None:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    for key in ("parcel_title", "item_title", "vinted_item_title"):
+        value = _clean_public_text(record.get(key) or extra.get(key))
+        if value:
+            return value
+    cross_reference = extra.get("vinted_cross_reference")
+    if isinstance(cross_reference, dict):
+        for key in ("parcel_title", "item_title", "vinted_item_title"):
+            value = _clean_public_text(cross_reference.get(key))
+            if value:
+                return value
+    return None
+
+
+def _parcel_other_party(record: dict[str, Any]) -> str | None:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    for key in ("other_party", "seller", "vinted_other_party"):
+        value = _clean_public_text(record.get(key) or extra.get(key))
+        if value:
+            return value
+    cross_reference = extra.get("vinted_cross_reference")
+    if isinstance(cross_reference, dict):
+        for key in ("other_party", "seller", "vinted_other_party"):
+            value = _clean_public_text(cross_reference.get(key))
+            if value:
+                return value
+    return None
+
+
+def _expected_date_end(record: dict[str, Any]) -> str | None:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    value = (
+        record.get("expected_date_end")
+        or extra.get("expected_date_end")
+        or extra.get("vinted_expected_date_to")
+    )
+    return _date_from_value(value)
+
+
+def _expected_date_label(record: dict[str, Any]) -> str | None:
+    start = _date_from_value(record.get("expected_date"))
+    end = _expected_date_end(record)
+    if start and end and start != end:
+        return _date_range_label(start, end)
+    if start:
+        return _date_label(start) if _is_vinted_record(record) else start
+    return None
+
+
+def _tracking_events(record: dict[str, Any]) -> list[dict[str, str]]:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    events = extra.get("tracking_events")
+    if not isinstance(events, list):
+        return []
+    public: list[dict[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        status = _clean_public_text(event.get("status"))
+        timestamp = _clean_public_text(event.get("timestamp") or event.get("date"))
+        if not status or not timestamp:
+            continue
+        item = {"status": status[:120], "timestamp": timestamp[:40]}
+        location = _clean_public_text(event.get("location"))
+        if location:
+            item["location"] = location[:120]
+        tracking_code = _clean_public_text(event.get("tracking_code"))
+        if tracking_code:
+            item["tracking_code"] = tracking_code[:80]
+        public.append(item)
+        if len(public) >= 10:
+            break
+    return public
+
+
+def _date_range_label(start: str, end: str) -> str:
+    start_date = _parse_iso_date(start)
+    end_date = _parse_iso_date(end)
+    if not start_date or not end_date:
+        return f"{start} t/m {end}"
+    if start_date.year == end_date.year and start_date.month == end_date.month:
+        return f"{start_date.day}-{end_date.day} {_MONTHS_NL[start_date.month]}"
+    return f"{_date_label(start)} - {_date_label(end)}"
+
+
+def _date_label(value: str) -> str:
+    parsed = _parse_iso_date(value)
+    if not parsed:
+        return value
+    return f"{parsed.day} {_MONTHS_NL[parsed.month]}"
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    text = _date_from_value(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _clean_public_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split()).strip()
+    if not text or text.lower() in {"unknown", "onbekend", "none", "null"}:
+        return None
+    return text
 
 
 def _active_sort_key(record: dict[str, Any]) -> tuple[int, str, str, str]:
