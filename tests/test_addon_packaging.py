@@ -20,7 +20,9 @@ def test_tracking_scraper_addon_metadata_is_present():
     assert config["schema"]["headless"] == "bool"
     assert config["schema"]["vinted_auto_login"] == "bool"
     assert config["schema"]["vinted_password"] == "password?"
+    assert config["schema"]["vinted_session_cookie"] == "password?"
     assert config["schema"]["vinted_password_2"] == "password?"
+    assert config["schema"]["vinted_session_cookie_2"] == "password?"
 
 
 def test_tracking_scraper_addon_has_runtime_files():
@@ -30,6 +32,7 @@ def test_tracking_scraper_addon_has_runtime_files():
 
     assert "mcr.microsoft.com/playwright/python" in dockerfile
     assert "aiohttp>=3.10,<4" in dockerfile
+    assert "cloudscraper==1.2.71" in dockerfile
     assert 'CMD ["/run.sh"]' in dockerfile
     assert run_script.exists()
     assert app.exists()
@@ -39,3 +42,5 @@ def test_tracking_scraper_addon_has_runtime_files():
     assert 'addon_options.get("timeout")' in app_text
     assert '"chronopost"' in app_text
     assert '"/login/vinted"' in app_text
+    assert '"/login/vinted/session"' in app_text
+    assert '"/parcels/vinted"' in app_text

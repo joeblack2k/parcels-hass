@@ -130,3 +130,25 @@ def test_dashboard_hides_zero_length_placeholder_window():
     assert record["delivery_window_start"] is None
     assert record["delivery_window_end"] is None
     assert record["display_subtitle"] == "FedEx 2026-05-05"
+
+
+def test_dashboard_labels_vinted_cross_reference_as_vinted():
+    snapshot = build_dashboard_snapshot(
+        [
+            {
+                "key": "chronopost:xu152297803jf",
+                "carrier": "chronopost",
+                "shop": "Vinted",
+                "tracking_code": "XU152297803JF",
+                "status": "ready_for_pickup",
+                "pickup_location": "DROOMVISIE",
+                "source": "vinted_sidecar_cross_reference",
+                "extra": {"vinted_cross_reference": {"status": "ready_for_pickup"}},
+            }
+        ],
+        now=datetime(2026, 5, 6, 15, 0, tzinfo=TZ),
+    )
+
+    assert snapshot["counts"]["pickup"] == 1
+    assert snapshot["active"][0]["display_title"] == "Vinted"
+    assert snapshot["active"][0]["display_subtitle"] == "Vinted afhalen bij DROOMVISIE"

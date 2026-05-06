@@ -209,7 +209,7 @@ def _public_dashboard_record(record: dict[str, Any], *, today: str) -> dict[str,
 
 def _display_subtitle(record: dict[str, Any]) -> str:
     status = str(record.get("status") or STATUS_UNKNOWN)
-    carrier = _carrier_title(record.get("carrier"))
+    carrier = _display_carrier_title(record)
     if status == STATUS_READY_FOR_PICKUP:
         location = record.get("pickup_location")
         return f"{carrier} afhalen bij {location}" if location else f"{carrier} afhalen"
@@ -221,6 +221,15 @@ def _display_subtitle(record: dict[str, Any]) -> str:
     if expected_date:
         return f"{carrier} {expected_date}"
     return record.get("tracking_status_text") or _status_label(status)
+
+
+def _display_carrier_title(record: dict[str, Any]) -> str:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    shop = str(record.get("shop") or "")
+    source = str(record.get("source") or "").lower()
+    if shop.lower() == "vinted" or source.startswith("vinted") or extra.get("vinted_cross_reference"):
+        return "Vinted"
+    return _carrier_title(record.get("carrier"))
 
 
 def _active_sort_key(record: dict[str, Any]) -> tuple[int, str, str, str]:

@@ -136,13 +136,15 @@ def _carrier_record_from_vinted_reference(
     merged["tracking_code"] = reference["tracking_code"]
     merged["tracking_url"] = reference.get("tracking_url") or record.get("tracking_url")
     merged["shop"] = record.get("shop") or "Vinted"
-    merged["source"] = "vinted_cross_reference"
+    merged["source"] = "vinted_sidecar_cross_reference" if _is_authoritative_vinted_record(record) else "vinted_cross_reference"
     merged["confidence"] = "high"
     merged["extra"] = {
         **extra,
         "carrier_tracking": reference,
         "vinted_cross_reference": _vinted_reference_snapshot(record),
     }
+    if _is_authoritative_vinted_record(record):
+        _clear_stale_fulfillment_fields(merged)
     merged.pop("key", None)
     return merged
 
@@ -162,8 +164,9 @@ def _merge_vinted_into_carrier(
     if _generic_carrier_shop(merged.get("shop")) and vinted_record.get("shop"):
         merged["shop"] = vinted_record["shop"]
 
+    authoritative = _is_authoritative_vinted_record(vinted_record)
     vinted_status = str(vinted_record.get("status") or STATUS_UNKNOWN)
-    if vinted_status != STATUS_UNKNOWN and _status_rank(vinted_status) >= _status_rank(merged.get("status")):
+    if vinted_status != STATUS_UNKNOWN and (authoritative or _status_rank(vinted_status) >= _status_rank(merged.get("status"))):
         merged["status"] = vinted_status
 
     for key in (
@@ -185,13 +188,15 @@ def _merge_vinted_into_carrier(
         if vinted_record.get(key) and not merged.get(key):
             merged[key] = vinted_record[key]
 
-    merged["source"] = "vinted_cross_reference"
+    merged["source"] = "vinted_sidecar_cross_reference" if authoritative else "vinted_cross_reference"
     merged["extra"] = {
         **extra,
         **vinted_extra,
         "carrier_tracking": reference,
         "vinted_cross_reference": _vinted_reference_snapshot(vinted_record),
     }
+    if authoritative:
+        _clear_stale_fulfillment_fields(merged)
     return merged
 
 
@@ -273,6 +278,30 @@ def _record_has_strong_fulfillment_state(record: dict[str, Any]) -> bool:
     if source.startswith("manual_correction"):
         return record.get("status") in (STATUS_READY_FOR_PICKUP, STATUS_DELIVERED, STATUS_PICKED_UP)
     return bool(record.get("pickup_location") and record.get("status") == STATUS_READY_FOR_PICKUP)
+
+
+def _is_authoritative_vinted_record(record: dict[str, Any]) -> bool:
+    source = clean_text(str(record.get("source") or "")).lower()
+    return source.startswith("vinted_sidecar")
+
+
+def _clear_stale_fulfillment_fields(record: dict[str, Any]) -> None:
+    status = record.get("status")
+    if status in (STATUS_DELIVERED, STATUS_PICKED_UP, "cancelled"):
+        record["expected_date"] = None
+        record["delivery_window_start"] = None
+        record["delivery_window_end"] = None
+        record["pickup_location"] = None
+        record["pickup_code"] = None
+        return
+    if status == STATUS_READY_FOR_PICKUP:
+        record["expected_date"] = None
+        record["delivery_window_start"] = None
+        record["delivery_window_end"] = None
+        return
+    if status != STATUS_READY_FOR_PICKUP:
+        record["pickup_location"] = None
+        record["pickup_code"] = None
 
 
 def _update_has_strong_fulfillment_detail(update: dict[str, Any]) -> bool:

@@ -10,7 +10,7 @@ Supported carriers:
 
 - FedEx
 - Chronopost
-- Vinted login/session refresh (experimental; tracking enrichment follows later)
+- Vinted login/session refresh and normalized parcel mirroring (experimental)
 
 ## Options
 
@@ -24,8 +24,10 @@ Supported carriers:
 | `vinted_login_interval_hours` | `22` | Delay between automatic Vinted login refreshes. |
 | `vinted_email` | not set | First Vinted account e-mail; keep this local in the add-on options. |
 | `vinted_password` | not set | First Vinted password; stored by Home Assistant as a password option. |
+| `vinted_session_cookie` | not set | Optional first-account Vinted browser session cookie. Prefer this when Vinted blocks password auth. |
 | `vinted_email_2` | not set | Optional second Vinted account e-mail. |
 | `vinted_password_2` | not set | Optional second Vinted password; stored by Home Assistant as a password option. |
+| `vinted_session_cookie_2` | not set | Optional second-account Vinted browser session cookie. Prefer this when Vinted blocks password auth. |
 
 ## Vinted Auto Login
 
@@ -39,13 +41,35 @@ two-factor prompts, suspicious-login checks, or account challenges; it returns a
 clear status such as `captcha_required`, `two_factor_required`, or
 `login_required`.
 
+The parcel mirror uses a lighter API-first flow before it opens Chromium. If
+Vinted rejects password auth, you can provide a local `vinted_session_cookie`
+captured from an already logged-in browser profile. The add-on accepts only
+Vinted session/refresh cookies, refreshes `access_token_web` locally when
+possible, and never returns cookie values in `/health`, `/login/vinted/status`,
+or `/parcels/vinted`.
+
+For private setups or browser-extension bridges, `POST /login/vinted/session`
+accepts `{"account": "account_1", "cookie": "..."}` or a Chrome-style
+`cookies` list. It stores only a sanitized Vinted cookie string in
+`/data/vinted_sessions.json` and marks that account usable for API refreshes.
+
 Useful endpoints:
 
 - `GET /login/vinted/status`
 - `POST /login/vinted`
+- `POST /login/vinted/session`
+- `GET /parcels/vinted`
+- `POST /parcels/vinted`
 
 POST without a body refreshes all configured accounts. To refresh one account,
 send `{"account": "account_1"}` or `{"account": "account_2"}`.
+
+`/parcels/vinted` opens the already logged-in local profiles, reads Vinted
+shipment/order pages and browser JSON responses, and returns only normalized
+parcel records. It does not return raw page text, cookies, browser storage, or
+account tokens. When Vinted shows a carrier tracking reference, the response
+keeps `carrier: vinted` and includes `extra.carrier_tracking` so the Home
+Assistant integration can merge Vinted truth into the carrier package key.
 
 Both endpoints are protected by `scraper_token` when you configure one. Keep
 this add-on on your LAN and do not expose it to the public internet.

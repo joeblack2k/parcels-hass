@@ -207,3 +207,68 @@ def test_strong_chronopost_delivery_update_can_still_win():
     assert merged["status"] == "delivered"
     assert merged["pickup_location"] is None
     assert merged["tracking_status_text"] == "Livré"
+
+
+def test_vinted_sidecar_can_correct_stale_pickup_to_in_transit():
+    record = apply_vinted_cross_reference(
+        {
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "XU152297803JF",
+            "status": "in_transit",
+            "source": "vinted_sidecar",
+            "confidence": "high",
+            "extra": {
+                "carrier_tracking": {
+                    "carrier": "chronopost",
+                    "tracking_code": "XU152297803JF",
+                }
+            },
+        },
+        {
+            "chronopost:xu152297803jf": {
+                "carrier": "chronopost",
+                "shop": "Vinted",
+                "tracking_code": "XU152297803JF",
+                "status": "ready_for_pickup",
+                "pickup_location": "DROOMVISIE - SCHOOLSTRAAT 109A - VOORSCHOTEN",
+                "pickup_code": "034049",
+                "source": "vinted_cross_reference",
+                "extra": {"vinted_cross_reference": {"status": "ready_for_pickup"}},
+            }
+        },
+    )
+
+    assert record["carrier"] == "chronopost"
+    assert record["status"] == "in_transit"
+    assert record["pickup_location"] is None
+    assert record["pickup_code"] is None
+    assert record["source"] == "vinted_sidecar_cross_reference"
+
+
+def test_vinted_sidecar_pickup_keeps_location_and_uses_vinted_source():
+    record = apply_vinted_cross_reference(
+        {
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "XU152297803JF",
+            "status": "ready_for_pickup",
+            "pickup_location": "DROOMVISIE Schoolstraat 109A Voorschoten",
+            "pickup_code": "034049",
+            "source": "vinted_sidecar",
+            "confidence": "high",
+            "extra": {
+                "carrier_tracking": {
+                    "carrier": "chronopost",
+                    "tracking_code": "XU152297803JF",
+                }
+            },
+        },
+        {},
+    )
+
+    assert record["carrier"] == "chronopost"
+    assert record["status"] == "ready_for_pickup"
+    assert record["pickup_location"] == "DROOMVISIE Schoolstraat 109A Voorschoten"
+    assert record["pickup_code"] == "034049"
+    assert record["source"] == "vinted_sidecar_cross_reference"

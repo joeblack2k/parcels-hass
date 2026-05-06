@@ -26,6 +26,7 @@ async def async_setup_platform(
         [
             PackageInboxDashboardSensor(hass),
             PackageInboxExpectedTodaySensor(hass),
+            PackageInboxPickupReadySensor(hass),
             PackageInboxNextDeliveryWindowSensor(hass),
             PackageInboxDeliveryWindowWeightSensor(hass),
         ]
@@ -81,6 +82,40 @@ class PackageInboxExpectedTodaySensor(PackageInboxEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         attrs = super().extra_state_attributes
         attrs["packages"] = self._snapshot.get("packages") or []
+        return attrs
+
+
+class PackageInboxPickupReadySensor(PackageInboxEntity, SensorEntity):
+    """Number of packages waiting at pickup points."""
+
+    _attr_icon = "mdi:package-check"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        super().__init__(
+            hass,
+            key="pickup_ready",
+            name="Parcels Pickup Ready",
+        )
+
+    @callback
+    def _refresh(self) -> None:
+        self._snapshot = self.manager.dashboard_snapshot()
+        self._update_from_snapshot()
+
+    @callback
+    def _update_from_snapshot(self) -> None:
+        counts = self._snapshot.get("counts") or {}
+        self._attr_native_value = counts.get("pickup", 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = super().extra_state_attributes
+        attrs["packages"] = [
+            record
+            for record in self._snapshot.get("active") or []
+            if isinstance(record, dict) and record.get("status") == "ready_for_pickup"
+        ]
         return attrs
 
 

@@ -375,6 +375,15 @@ class PackageInboxManager:
         errors: list[dict[str, str]] = []
         diagnostics: list[dict[str, Any]] = []
 
+        vinted_records, vinted_diagnostics = await self._async_vinted_sidecar_records_for_refresh(
+            package_key=package_key,
+            candidates=candidates,
+        )
+        diagnostics.extend(vinted_diagnostics)
+        if vinted_records:
+            stored = await self._async_store_records(vinted_records, notify=notify)
+            refreshed.extend(stored)
+
         for key, current in candidates:
             record = _normalize_record(current)
             record["key"] = key
@@ -403,6 +412,33 @@ class PackageInboxManager:
             "diagnostics": diagnostics,
             "count": len(refreshed),
         }
+
+    async def _async_vinted_sidecar_records_for_refresh(
+        self,
+        *,
+        package_key: str | None,
+        candidates: list[tuple[str, dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if package_key and not any(_record_has_vinted_source(record) for _, record in candidates):
+            return ([], [])
+        result = await self._async_fetch_vinted_sidecar_records()
+        if not result:
+            return ([], [])
+        records = result.get("records") if isinstance(result.get("records"), list) else []
+        diagnostics = [
+            {
+                "key": "vinted_sidecar",
+                "carrier": "vinted",
+                "status": result.get("status"),
+                "source": "vinted_sidecar",
+                "supported": result.get("supported", True),
+                "error": result.get("error"),
+                "tracking_refresh_url": result.get("tracking_refresh_url"),
+                "has_delivery_detail": bool(records),
+                "count": len(records),
+            }
+        ]
+        return ([record for record in records if isinstance(record, dict)], diagnostics)
 
     async def async_process_imap_event(
         self,
@@ -1083,6 +1119,95 @@ class PackageInboxManager:
             _LOGGER.debug("Tracking scraper failed for %s: %s", record.get("key"), err)
             return None
 
+    async def _async_fetch_vinted_sidecar_records(self) -> dict[str, Any] | None:
+        """Mirror normalized Vinted parcels from the optional local browser sidecar."""
+        base_url = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_URL))
+        if not base_url:
+            return None
+
+        endpoint = urljoin(base_url.rstrip("/") + "/", "parcels/vinted")
+        session = async_get_clientsession(self.hass)
+        timeout = ClientTimeout(total=int(self.config[CONF_TRACKING_TIMEOUT]))
+        headers = {
+            "User-Agent": self.config[CONF_TRACKING_USER_AGENT],
+            "Accept": "application/json",
+        }
+        token = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_TOKEN))
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            async with session.get(endpoint, headers=headers, timeout=timeout) as response:
+                text = await response.text(errors="replace")
+                if response.status >= 400:
+                    return {
+                        "status": "error",
+                        "supported": True,
+                        "error": f"vinted_sidecar_http_{response.status}",
+                        "tracking_refresh_url": str(response.url),
+                        "records": [],
+                    }
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    return {
+                        "status": "error",
+                        "supported": True,
+                        "error": "vinted_sidecar_non_json",
+                        "tracking_refresh_url": str(response.url),
+                        "records": [],
+                    }
+        except TimeoutError:
+            return {
+                "status": "error",
+                "supported": True,
+                "error": "vinted_sidecar_timeout",
+                "tracking_refresh_url": endpoint,
+                "records": [],
+            }
+        except ClientError as err:
+            _LOGGER.debug("Vinted sidecar failed: %s", err)
+            return None
+
+        records = payload.get("records") if isinstance(payload, dict) else None
+        if not isinstance(records, list):
+            return {
+                "status": "error",
+                "supported": True,
+                "error": "vinted_sidecar_missing_records",
+                "tracking_refresh_url": endpoint,
+                "records": [],
+            }
+
+        normalized_records: list[dict[str, Any]] = []
+        checked_at = dt_util.now().isoformat()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            normalized = _normalize_record(
+                {
+                    **record,
+                    "carrier": record.get("carrier") or "vinted",
+                    "shop": record.get("shop") or "Vinted",
+                    "source": record.get("source") or "vinted_sidecar",
+                    "confidence": record.get("confidence") or "high",
+                    "tracking_refresh_source": "vinted_sidecar",
+                    "tracking_refresh_supported": True,
+                    "tracking_last_checked": checked_at,
+                }
+            )
+            if not _record_exclusion_reason(normalized):
+                normalized_records.append(normalized)
+
+        return {
+            "status": payload.get("status") or "ok",
+            "supported": True,
+            "error": payload.get("error"),
+            "tracking_refresh_url": endpoint,
+            "records": normalized_records,
+            "accounts": payload.get("accounts"),
+        }
+
     def _postnl_tracking_update(self, record: dict[str, Any]) -> dict[str, Any] | None:
         state = self.hass.states.get(self.config[CONF_POSTNL_DELIVERY_SENSOR])
         if state is None:
@@ -1155,13 +1280,16 @@ class PackageInboxManager:
         location = record.get("pickup_location")
         code = record.get("pickup_code")
         shop = record.get("shop")
+        display = _notification_package_title(record)
 
-        first_line = f"{carrier} pakket ligt klaar"
+        first_line = f"{display} pakket ligt klaar"
         if location:
             first_line += f" bij {location}"
 
         lines = [first_line]
-        if shop and shop.lower() != carrier.lower():
+        if carrier.lower() != display.lower():
+            lines.append(f"Vervoerder: {carrier}")
+        if shop and shop.lower() not in {carrier.lower(), display.lower()}:
             lines.append(f"Van: {shop}")
         if code:
             lines.append(f"Code: {code}")
@@ -1849,6 +1977,25 @@ def _tracking_diagnostic(key: str, record: dict[str, Any], update: dict[str, Any
         "tracking_refresh_url": update.get("tracking_refresh_url"),
         "has_delivery_detail": _tracking_update_has_delivery_detail(update),
     }
+
+
+def _record_has_vinted_source(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    return (
+        _carrier_slug(record.get("carrier")) == "vinted"
+        or clean_text(str(record.get("shop") or "")).lower() == "vinted"
+        or clean_text(str(record.get("source") or "")).lower().startswith("vinted")
+        or bool(extra.get("vinted_cross_reference"))
+    )
+
+
+def _notification_package_title(record: dict[str, Any]) -> str:
+    if _record_has_vinted_source(record):
+        return "Vinted"
+    shop = clean_text(str(record.get("shop") or ""))
+    if shop:
+        return shop
+    return _carrier_title(record.get("carrier"))
 
 
 def _email_exclusion_reason(fields: dict[str, str]) -> str | None:

@@ -13,7 +13,7 @@ WORKDIR /app
 COPY app ./app
 COPY run.sh /run.sh
 
-RUN pip install --no-cache-dir "aiohttp>=3.10,<4" "playwright==1.56.0" \
+RUN pip install --no-cache-dir "aiohttp>=3.10,<4" "cloudscraper==1.2.71" "playwright==1.56.0" \
     && chmod a+x /run.sh
 
 ENV HOST=0.0.0.0
