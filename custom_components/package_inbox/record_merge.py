@@ -27,6 +27,27 @@ TRACKING_DIAGNOSTIC_FIELDS = {
     "tracking_refresh_has_delivery_detail",
 }
 
+VINTED_CARRIER_SLUGS = {
+    "chronopost",
+    "dhl",
+    "dpd",
+    "gls",
+    "homerr",
+    "postnl",
+    "ups",
+}
+
+VINTED_DETAIL_EXTRA_KEYS = {
+    "expected_date_end",
+    "tracking_events",
+    "vinted_expected_date_to",
+    "vinted_id",
+    "vinted_item_title",
+    "vinted_other_party",
+    "vinted_thread_id",
+    "vinted_tracking_code",
+}
+
 
 def apply_vinted_cross_reference(
     record: dict[str, Any],
@@ -42,13 +63,58 @@ def apply_vinted_cross_reference(
             return _merge_vinted_into_carrier(existing, record, reference)
         return carrier_record
 
+    if _carrier_slug(record.get("carrier")) == "vinted":
+        inferred = _probable_carrier_reference_for_vinted_record(record, packages)
+        if inferred:
+            carrier_record = _carrier_record_from_vinted_reference(record, inferred)
+            key = stable_key(carrier_record)
+            existing = packages.get(key)
+            merged = (
+                _merge_vinted_into_carrier(existing, record, inferred)
+                if isinstance(existing, dict)
+                else carrier_record
+            )
+            _mark_vinted_auto_link(merged, inferred, reason="single_vinted_carrier_candidate")
+            return merged
+
     linked_vinted = _linked_vinted_record(record, packages)
     if linked_vinted:
         linked_reference = carrier_tracking_reference(linked_vinted)
         if linked_reference:
             return _merge_vinted_into_carrier(record, linked_vinted, linked_reference)
 
+    probable_vinted = _probable_vinted_record_for_carrier(record, packages)
+    if probable_vinted:
+        inferred = _carrier_reference_from_carrier_record(record)
+        if inferred:
+            merged = _merge_vinted_into_carrier(record, probable_vinted, inferred)
+            _mark_vinted_auto_link(merged, inferred, reason="stored_vinted_candidate")
+            return merged
+
     return record
+
+
+def reconcile_vinted_carrier_links(packages: dict[str, dict[str, Any]]) -> list[str]:
+    """Collapse high-confidence Vinted/carrier duplicates already in storage."""
+    changed: list[str] = []
+    for key, record in list(packages.items()):
+        if key not in packages or not isinstance(record, dict):
+            continue
+        if _carrier_slug(record.get("carrier")) != "vinted":
+            continue
+
+        other_packages = {other_key: value for other_key, value in packages.items() if other_key != key}
+        merged = apply_vinted_cross_reference(record, other_packages)
+        if _carrier_slug(merged.get("carrier")) == "vinted":
+            continue
+
+        new_key = merged.get("key") or stable_key(merged)
+        merged["key"] = new_key
+        if new_key != key:
+            packages.pop(key, None)
+        packages[new_key] = merged
+        changed.append(new_key)
+    return changed
 
 
 def carrier_tracking_reference(record: dict[str, Any]) -> dict[str, str] | None:
@@ -223,11 +289,170 @@ def _linked_vinted_record(
     return None
 
 
+def _probable_carrier_reference_for_vinted_record(
+    record: dict[str, Any],
+    packages: dict[str, dict[str, Any]],
+) -> dict[str, str] | None:
+    if not _is_vinted_record(record) or not _vinted_record_has_linkable_detail(record):
+        return None
+
+    strong_matches: list[dict[str, Any]] = []
+    context_matches: list[dict[str, Any]] = []
+    for candidate in packages.values():
+        if not isinstance(candidate, dict) or not _is_vinted_carrier_candidate(candidate):
+            continue
+        if not _vinted_link_status_compatible(record, candidate):
+            continue
+        if _vinted_records_share_platform_id(record, candidate) or _same_tracking_code(record, candidate):
+            strong_matches.append(candidate)
+            continue
+        if _record_has_vinted_context(candidate) and _carrier_record_needs_vinted_detail(candidate):
+            context_matches.append(candidate)
+
+    matches = strong_matches or context_matches
+    if len(matches) != 1:
+        return None
+    return _carrier_reference_from_carrier_record(matches[0])
+
+
+def _probable_vinted_record_for_carrier(
+    record: dict[str, Any],
+    packages: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not _is_vinted_carrier_candidate(record) or not _record_has_vinted_context(record):
+        return None
+
+    matches: list[dict[str, Any]] = []
+    for candidate in packages.values():
+        if not isinstance(candidate, dict) or not _is_vinted_record(candidate):
+            continue
+        if carrier_tracking_reference(candidate):
+            continue
+        if not _vinted_record_has_linkable_detail(candidate):
+            continue
+        if not _vinted_link_status_compatible(candidate, record):
+            continue
+        if _vinted_records_share_platform_id(candidate, record) or _same_tracking_code(candidate, record):
+            return candidate
+        if _carrier_record_needs_vinted_detail(record):
+            matches.append(candidate)
+
+    return matches[0] if len(matches) == 1 else None
+
+
+def _carrier_reference_from_carrier_record(record: dict[str, Any]) -> dict[str, str] | None:
+    carrier = _carrier_slug(record.get("carrier"))
+    tracking_code = clean_text(str(record.get("tracking_code") or "")).upper()
+    if carrier not in VINTED_CARRIER_SLUGS or not tracking_code:
+        return None
+    reference = {"carrier": carrier, "tracking_code": tracking_code}
+    tracking_url = clean_text(str(record.get("tracking_url") or ""))
+    if tracking_url:
+        reference["tracking_url"] = tracking_url
+    return reference
+
+
+def _is_vinted_record(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    return (
+        _carrier_slug(record.get("carrier")) == "vinted"
+        or clean_text(str(record.get("shop") or "")).lower() == "vinted"
+        or clean_text(str(record.get("source") or "")).lower().startswith("vinted")
+        or bool(extra.get("vinted_cross_reference"))
+        or any(extra.get(key) for key in VINTED_DETAIL_EXTRA_KEYS)
+    )
+
+
+def _is_vinted_carrier_candidate(record: dict[str, Any]) -> bool:
+    carrier = _carrier_slug(record.get("carrier"))
+    tracking_code = clean_text(str(record.get("tracking_code") or ""))
+    return carrier in VINTED_CARRIER_SLUGS and bool(tracking_code)
+
+
+def _record_has_vinted_context(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    return (
+        clean_text(str(record.get("shop") or "")).lower() == "vinted"
+        or clean_text(str(record.get("source") or "")).lower().startswith("vinted")
+        or bool(extra.get("vinted_cross_reference"))
+        or any(extra.get(key) for key in VINTED_DETAIL_EXTRA_KEYS)
+    )
+
+
+def _vinted_record_has_linkable_detail(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    if any(extra.get(key) for key in VINTED_DETAIL_EXTRA_KEYS):
+        return True
+    return bool(record.get("expected_date") or record.get("pickup_code") or record.get("pickup_location"))
+
+
+def _carrier_record_needs_vinted_detail(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    return not any(extra.get(key) for key in ("vinted_item_title", "vinted_other_party", "tracking_events"))
+
+
+def _same_tracking_code(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_code = clean_text(str(left.get("tracking_code") or "")).upper()
+    right_code = clean_text(str(right.get("tracking_code") or "")).upper()
+    return bool(left_code and right_code and left_code == right_code)
+
+
+def _vinted_records_share_platform_id(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_ids = _vinted_platform_ids(left)
+    right_ids = _vinted_platform_ids(right)
+    return bool(left_ids and right_ids and left_ids & right_ids)
+
+
+def _vinted_platform_ids(record: dict[str, Any]) -> set[str]:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    values = {
+        record.get("tracking_code"),
+        extra.get("vinted_id"),
+        extra.get("vinted_tracking_code"),
+        extra.get("vinted_thread_id"),
+    }
+    cross_reference = extra.get("vinted_cross_reference")
+    if isinstance(cross_reference, dict):
+        values.update(
+            {
+                cross_reference.get("tracking_code"),
+                cross_reference.get("vinted_id"),
+                cross_reference.get("vinted_tracking_code"),
+                cross_reference.get("vinted_thread_id"),
+            }
+        )
+    return {clean_text(str(value)).upper() for value in values if clean_text(str(value or ""))}
+
+
+def _vinted_link_status_compatible(vinted_record: dict[str, Any], carrier_record: dict[str, Any]) -> bool:
+    vinted_status = str(vinted_record.get("status") or STATUS_UNKNOWN)
+    carrier_status = str(carrier_record.get("status") or STATUS_UNKNOWN)
+    if STATUS_DELIVERED in {vinted_status, carrier_status}:
+        return vinted_status == carrier_status
+    if STATUS_PICKED_UP in {vinted_status, carrier_status}:
+        return vinted_status == carrier_status
+    return True
+
+
+def _mark_vinted_auto_link(record: dict[str, Any], reference: dict[str, str], *, reason: str) -> None:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    record["extra"] = {
+        **extra,
+        "vinted_auto_link": {
+            "carrier": reference["carrier"],
+            "tracking_code": reference["tracking_code"],
+            "reason": reason,
+        },
+    }
+
+
 def _vinted_reference_snapshot(record: dict[str, Any]) -> dict[str, Any]:
-    return {
+    snapshot = {
         key: record.get(key)
         for key in (
             "key",
+            "tracking_code",
+            "tracking_url",
             "status",
             "expected_date",
             "delivery_window_start",
@@ -235,12 +460,18 @@ def _vinted_reference_snapshot(record: dict[str, Any]) -> dict[str, Any]:
             "pickup_location",
             "pickup_code",
             "qr_file_path",
+            "tracking_status_text",
             "source",
             "updated_at",
             "created_at",
         )
         if record.get(key)
     }
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    for key in VINTED_DETAIL_EXTRA_KEYS:
+        if extra.get(key):
+            snapshot[key] = extra[key]
+    return snapshot
 
 
 def _merge_tracking_diagnostics_only(

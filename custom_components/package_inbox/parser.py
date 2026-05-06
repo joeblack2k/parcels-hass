@@ -76,6 +76,42 @@ CARRIER_KEYWORDS = {
     "apotheek": ("benu", "apotheek", "medicijn", "medicatie"),
 }
 
+VINTED_MONTHS = {
+    "januari": 1,
+    "jan": 1,
+    "january": 1,
+    "februari": 2,
+    "feb": 2,
+    "february": 2,
+    "maart": 3,
+    "mrt": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "mei": 5,
+    "may": 5,
+    "juni": 6,
+    "jun": 6,
+    "june": 6,
+    "juli": 7,
+    "jul": 7,
+    "july": 7,
+    "augustus": 8,
+    "aug": 8,
+    "august": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "oktober": 10,
+    "okt": 10,
+    "oct": 10,
+    "october": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
 SHOP_HINTS = {
     "bol.com": ("bol.com", "bol ", "bol.com bestelling"),
     "Coolblue": ("coolblue",),
@@ -212,6 +248,18 @@ def parse_email(
     tracking_url = _extract_tracking_url(combined, tracking_code, carrier)
     carrier_tracking = _extract_embedded_carrier_tracking(combined, primary_carrier=carrier)
     expected_date = _extract_expected_date(combined, today)
+    extra: dict[str, Any] = {"carrier_tracking": carrier_tracking} if carrier_tracking else {}
+    if carrier == "vinted":
+        vinted_expected_date, expected_date_end = _extract_vinted_expected_date_range(combined, today)
+        if vinted_expected_date:
+            expected_date = vinted_expected_date
+        if expected_date_end:
+            extra["expected_date_end"] = expected_date_end
+            extra["vinted_expected_date_to"] = expected_date_end
+        tracking_code = tracking_code or (
+            carrier_tracking.get("tracking_code") if carrier_tracking else _extract_vinted_platform_tracking_code(combined)
+        )
+        extra.update(_extract_vinted_extra(combined))
     window_start, window_end = _extract_time_window(combined)
     status = _extract_status(combined, expected_date, today)
     pickup_code = _extract_pickup_code(combined, status)
@@ -255,7 +303,7 @@ def parse_email(
         message_id=message_id,
         imap_uid=imap_uid,
         raw_excerpt=_excerpt(combined),
-        extra={"carrier_tracking": carrier_tracking} if carrier_tracking else {},
+        extra=extra,
     )
     return [record.as_dict()]
 
@@ -638,6 +686,161 @@ def _extract_expected_date(value: str, today: date) -> str | None:
     except ValueError:
         return None
     return parsed.isoformat()
+
+
+def _extract_vinted_expected_date_range(value: str, today: date) -> tuple[str | None, str | None]:
+    text = clean_text(value).lower()
+    match = re.search(r"(verwachte levertijd|verwachte bezorging|expected delivery|estimated delivery)[:\s]+(.{0,90})", text)
+    candidates = [match.group(2)] if match else []
+    candidates.append(text)
+    month_names = "|".join(sorted(map(re.escape, VINTED_MONTHS), key=len, reverse=True))
+
+    for candidate in candidates:
+        for pattern in (
+            rf"\b(?P<m1>{month_names})\s+(?P<d1>\d{{1,2}})\s*(?:-|\u2013|\u2014|t/m|tot)\s*"
+            rf"(?:(?P<m2>{month_names})\s+)?(?P<d2>\d{{1,2}})(?:,?\s*(?P<year>20\d{{2}}))?\b",
+            rf"\b(?P<d1>\d{{1,2}})\s+(?P<m1>{month_names})\s*(?:-|\u2013|\u2014|t/m|tot)\s*"
+            rf"(?P<d2>\d{{1,2}})(?:\s+(?P<m2>{month_names}))?(?:\s+(?P<year>20\d{{2}}))?\b",
+        ):
+            range_match = re.search(pattern, candidate)
+            if not range_match:
+                continue
+            used_year = int(range_match.group("year") or today.year)
+            start = _date_iso(
+                int(range_match.group("d1")),
+                VINTED_MONTHS[range_match.group("m1")],
+                used_year,
+            )
+            end = _date_iso(
+                int(range_match.group("d2")),
+                VINTED_MONTHS[range_match.group("m2") or range_match.group("m1")],
+                used_year,
+            )
+            if start and end:
+                return (start, end)
+    return (None, None)
+
+
+def _date_iso(day: int, month: int, year: int) -> str | None:
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _extract_vinted_extra(value: str) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    platform_code = _extract_vinted_platform_tracking_code(value)
+    if platform_code:
+        extra["vinted_tracking_code"] = platform_code
+    item_title = _extract_vinted_item_title(value)
+    if item_title:
+        extra["vinted_item_title"] = item_title
+    other_party = _extract_vinted_other_party(value)
+    if other_party:
+        extra["vinted_other_party"] = other_party
+    events = _extract_vinted_tracking_events(value)
+    if events:
+        extra["tracking_events"] = events[:10]
+    return extra
+
+
+def _extract_vinted_platform_tracking_code(value: str) -> str | None:
+    match = re.search(r"\b(?:trackingnummer|tracking number|trackingcode|tracking code)\D{0,40}([A-Z0-9]{8,40})\b", value, re.IGNORECASE)
+    if match:
+        return re.sub(r"[^A-Z0-9]", "", match.group(1).upper())
+    return None
+
+
+def _extract_vinted_item_title(value: str) -> str | None:
+    match = re.search(r"\b(?:bundel:\s*)?(\d+\s+(?:artikel|artikelen|item|items))\b", value, re.IGNORECASE)
+    if match:
+        return clean_text(match.group(1))[:120]
+    skip = {
+        "aankoop geslaagd",
+        "bestelling verzonden",
+        "pakket volgen",
+        "trackinginformatie",
+        "trackingnummer",
+    }
+    for line in clean_text(value).splitlines()[:30]:
+        candidate = line.strip()
+        folded = candidate.lower()
+        if not candidate or folded in skip or folded.startswith(("eur ", "\u20ac")):
+            continue
+        if 3 <= len(candidate) <= 120 and "bestelling " in folded:
+            return clean_text(re.sub(r"(?i)\bbestelling\b", "", candidate)).strip()[:120]
+    return None
+
+
+def _extract_vinted_other_party(value: str) -> str | None:
+    match = re.search(r"\b(?:verkoper|seller)\s+([A-Za-z0-9_.-]{3,40})\b", value, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    for line in clean_text(value).splitlines()[:8]:
+        candidate = line.strip()
+        folded = candidate.lower()
+        if folded in {"vinted", "pakket volgen", "trackingnummer", "aankoop geslaagd"}:
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{2,39}", candidate):
+            return candidate
+    return None
+
+
+def _extract_vinted_tracking_events(value: str) -> list[dict[str, str]]:
+    normalized = re.sub(r"\s+", " ", clean_text(value))
+    status_pattern = (
+        r"Onderweg|Verzonden|Trackingcode aangemaakt(?:\s*-\s*[A-Z0-9]{8,40})?|"
+        r"In transit|Shipped|Tracking code created(?:\s*-\s*[A-Z0-9]{8,40})?|"
+        r"Klaar om op te halen|Ready for pickup|Afgeleverd|Delivered"
+    )
+    events: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in re.finditer(
+        rf"\b({status_pattern})\b\s+(\d{{1,2}}[-/]\d{{1,2}}[-/]20\d{{2}}),?\s+([0-2]?\d[:.][0-5]\d)",
+        normalized,
+        re.IGNORECASE,
+    ):
+        status = _vinted_event_status_label(match.group(1))
+        timestamp = _parse_vinted_event_timestamp(match.group(2), match.group(3))
+        if not timestamp:
+            continue
+        key = (status.lower(), timestamp)
+        if key in seen:
+            continue
+        seen.add(key)
+        event = {"status": status, "timestamp": timestamp}
+        code_match = re.search(r"\b([A-Z0-9]{8,40})\b", match.group(1))
+        if code_match and any(char.isdigit() for char in code_match.group(1)):
+            event["tracking_code"] = code_match.group(1).upper()
+        events.append(event)
+    return events
+
+
+def _parse_vinted_event_timestamp(date_text: str, time_text: str) -> str | None:
+    match = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](20\d{2})", date_text)
+    time_match = re.search(r"([0-2]?\d)[:.]([0-5]\d)", time_text)
+    if not match or not time_match:
+        return None
+    return (
+        f"{int(match.group(3)):04d}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
+        f"T{int(time_match.group(1)):02d}:{time_match.group(2)}:00"
+    )
+
+
+def _vinted_event_status_label(value: str) -> str:
+    folded = value.lower()
+    if "trackingcode aangemaakt" in folded or "tracking code created" in folded:
+        return "Trackingcode aangemaakt"
+    if "onderweg" in folded or "in transit" in folded:
+        return "Onderweg"
+    if "verzonden" in folded or "shipped" in folded:
+        return "Verzonden"
+    if "klaar" in folded or "ready for pickup" in folded:
+        return "Klaar om op te halen"
+    if "afgeleverd" in folded or "delivered" in folded:
+        return "Afgeleverd"
+    return clean_text(value)[:120]
 
 
 def _extract_time_window(value: str) -> tuple[str | None, str | None]:

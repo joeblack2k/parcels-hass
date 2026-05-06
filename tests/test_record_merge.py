@@ -12,7 +12,11 @@ package_inbox.__path__ = [str(PACKAGE_DIR)]
 sys.modules.setdefault("custom_components", custom_components)
 sys.modules.setdefault("custom_components.package_inbox", package_inbox)
 
-from custom_components.package_inbox.record_merge import apply_vinted_cross_reference, merge_tracking_update
+from custom_components.package_inbox.record_merge import (
+    apply_vinted_cross_reference,
+    merge_tracking_update,
+    reconcile_vinted_carrier_links,
+)
 
 
 def test_vinted_cross_reference_promotes_record_to_carrier_key_shape():
@@ -324,3 +328,162 @@ def test_vinted_dpd_manual_link_merges_platform_and_carrier_numbers():
     assert record["extra"]["vinted_item_title"] == "5 artikelen"
     assert record["extra"]["expected_date_end"] == "2026-05-13"
     assert record["extra"]["tracking_events"][0]["status"] == "Onderweg"
+
+
+def test_vinted_chronopost_rich_sidecar_reference_enriches_existing_carrier_record():
+    record = apply_vinted_cross_reference(
+        {
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "XU152297803JF",
+            "status": "in_transit",
+            "expected_date": "2026-05-11",
+            "source": "vinted_sidecar",
+            "confidence": "high",
+            "extra": {
+                "vinted_id": "1778051829299958",
+                "vinted_item_title": "5 artikelen",
+                "vinted_other_party": "bruijna1981",
+                "expected_date_end": "2026-05-13",
+                "carrier_tracking": {
+                    "carrier": "chronopost",
+                    "tracking_code": "XU152297803JF",
+                    "tracking_url": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF",
+                },
+                "tracking_events": [
+                    {"status": "Onderweg", "timestamp": "2026-05-06T14:49:00+02:00"},
+                ],
+            },
+        },
+        {
+            "chronopost:xu152297803jf": {
+                "key": "chronopost:xu152297803jf",
+                "carrier": "chronopost",
+                "shop": "Vinted",
+                "tracking_code": "XU152297803JF",
+                "tracking_status_text": "Pris en charge par Chronopost",
+                "status": "in_transit",
+                "source": "vinted_cross_reference",
+                "confidence": "high",
+            }
+        },
+    )
+
+    assert record["key"] == "chronopost:xu152297803jf"
+    assert record["carrier"] == "chronopost"
+    assert record["expected_date"] == "2026-05-11"
+    assert record["source"] == "vinted_sidecar_cross_reference"
+    assert record["extra"]["vinted_item_title"] == "5 artikelen"
+    assert record["extra"]["vinted_other_party"] == "bruijna1981"
+    assert record["extra"]["expected_date_end"] == "2026-05-13"
+    assert record["extra"]["tracking_events"][0]["status"] == "Onderweg"
+
+
+def test_rich_vinted_record_auto_links_single_existing_vinted_carrier_candidate():
+    record = apply_vinted_cross_reference(
+        {
+            "key": "vinted:1778051829299958",
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "1778051829299958",
+            "status": "in_transit",
+            "expected_date": "2026-05-11",
+            "source": "vinted_sidecar",
+            "confidence": "high",
+            "extra": {
+                "vinted_id": "1778051829299958",
+                "vinted_item_title": "5 artikelen",
+                "vinted_other_party": "bruijna1981",
+                "expected_date_end": "2026-05-13",
+            },
+        },
+        {
+            "chronopost:xu152297803jf": {
+                "key": "chronopost:xu152297803jf",
+                "carrier": "chronopost",
+                "shop": "Vinted",
+                "tracking_code": "XU152297803JF",
+                "status": "in_transit",
+                "source": "vinted_cross_reference",
+                "confidence": "high",
+            }
+        },
+    )
+
+    assert record["key"] == "chronopost:xu152297803jf"
+    assert record["carrier"] == "chronopost"
+    assert record["tracking_code"] == "XU152297803JF"
+    assert record["extra"]["carrier_tracking"]["carrier"] == "chronopost"
+    assert record["extra"]["vinted_auto_link"]["reason"] == "single_vinted_carrier_candidate"
+    assert record["extra"]["vinted_item_title"] == "5 artikelen"
+
+
+def test_rich_vinted_record_does_not_auto_link_ambiguous_carrier_candidates():
+    record = apply_vinted_cross_reference(
+        {
+            "key": "vinted:1778051829299958",
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "1778051829299958",
+            "status": "in_transit",
+            "expected_date": "2026-05-11",
+            "source": "vinted_sidecar",
+            "confidence": "high",
+            "extra": {"vinted_item_title": "5 artikelen"},
+        },
+        {
+            "chronopost:xu152297803jf": {
+                "key": "chronopost:xu152297803jf",
+                "carrier": "chronopost",
+                "shop": "Vinted",
+                "tracking_code": "XU152297803JF",
+                "status": "in_transit",
+                "source": "vinted_cross_reference",
+            },
+            "dpd:34343180322236": {
+                "key": "dpd:34343180322236",
+                "carrier": "dpd",
+                "shop": "Vinted",
+                "tracking_code": "34343180322236",
+                "status": "in_transit",
+                "source": "vinted_cross_reference",
+            },
+        },
+    )
+
+    assert record["carrier"] == "vinted"
+    assert record["tracking_code"] == "1778051829299958"
+
+
+def test_reconcile_vinted_carrier_links_removes_duplicate_vinted_record():
+    packages = {
+        "vinted:1778051829299958": {
+            "key": "vinted:1778051829299958",
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "1778051829299958",
+            "status": "in_transit",
+            "expected_date": "2026-05-11",
+            "source": "vinted_sidecar",
+            "confidence": "high",
+            "extra": {
+                "vinted_id": "1778051829299958",
+                "vinted_item_title": "5 artikelen",
+            },
+        },
+        "chronopost:xu152297803jf": {
+            "key": "chronopost:xu152297803jf",
+            "carrier": "chronopost",
+            "shop": "Vinted",
+            "tracking_code": "XU152297803JF",
+            "status": "in_transit",
+            "source": "vinted_cross_reference",
+            "confidence": "high",
+        },
+    }
+
+    changed = reconcile_vinted_carrier_links(packages)
+
+    assert changed == ["chronopost:xu152297803jf"]
+    assert "vinted:1778051829299958" not in packages
+    assert packages["chronopost:xu152297803jf"]["extra"]["vinted_item_title"] == "5 artikelen"

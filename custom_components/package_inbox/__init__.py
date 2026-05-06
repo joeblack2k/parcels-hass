@@ -79,7 +79,7 @@ from .const import (
 )
 from .dashboard import build_dashboard_snapshot
 from .parser import clean_text, is_likely_package_email, parse_email, stable_key
-from .record_merge import apply_vinted_cross_reference, merge_tracking_update
+from .record_merge import apply_vinted_cross_reference, merge_tracking_update, reconcile_vinted_carrier_links
 from .tracking import (
     TRACKING_BLOCKED_ERROR,
     build_fedex_tracking_api_url,
@@ -761,6 +761,13 @@ class PackageInboxManager:
 
             if notify:
                 await self._async_maybe_notify_record(normalized)
+
+        reconciled_keys = reconcile_vinted_carrier_links(packages)
+        for key in reconciled_keys:
+            if key in packages:
+                packages[key]["updated_at"] = now
+            if key not in stored_keys:
+                stored_keys.append(key)
 
         if stored_keys:
             self.data["last_updated"] = now

@@ -99,6 +99,42 @@ def test_vinted_order_confirmation_before_shipment_is_ignored():
     assert records == []
 
 
+def test_vinted_shipped_mail_extracts_product_eta_events_and_platform_tracking():
+    records = parse_email(
+        subject="Bestelling verzonden",
+        sender="Team Vinted <no-reply@vinted.nl>",
+        text=(
+            "bruijna1981\n"
+            "5 artikelen\n"
+            "Bestelling verzonden.\n"
+            "Je bestelling is onderweg! Verwachte levertijd: mei 11 - mei 13\n"
+            "Pakket volgen\n"
+            "Trackingnummer 1778051829299958\n"
+            "Onderweg 06-05-2026, 14:49\n"
+            "Verzonden 06-05-2026, 10:10\n"
+            "Trackingcode aangemaakt - 1778051829299958 06-05-2026, 09:17"
+        ),
+        today=date(2026, 5, 6),
+    )
+
+    assert len(records) == 1
+    assert records[0]["carrier"] == "vinted"
+    assert records[0]["status"] == "in_transit"
+    assert records[0]["tracking_code"] == "1778051829299958"
+    assert records[0]["expected_date"] == "2026-05-11"
+    assert records[0]["extra"]["expected_date_end"] == "2026-05-13"
+    assert records[0]["extra"]["vinted_item_title"] == "5 artikelen"
+    assert records[0]["extra"]["vinted_other_party"] == "bruijna1981"
+    assert [event["status"] for event in records[0]["extra"]["tracking_events"]] == [
+        "Onderweg",
+        "Verzonden",
+        "Trackingcode aangemaakt",
+    ]
+    assert "tracking_code" not in records[0]["extra"]["tracking_events"][0]
+    assert "tracking_code" not in records[0]["extra"]["tracking_events"][1]
+    assert records[0]["extra"]["tracking_events"][2]["tracking_code"] == "1778051829299958"
+
+
 def test_dpd_to_pickup_point_is_in_transit_without_pickup_ready_location():
     records = parse_email(
         subject="Je pakket is binnen 1 tot 3 werkdagen in het DPD Pakketpunt",
