@@ -82,6 +82,14 @@ PLACEHOLDER_PICKUP_LOCATIONS = {
 
 
 @dataclass(slots=True)
+class VintedAccount:
+    key: str
+    email: str
+    password: str
+    profile_dir: Path
+
+
+@dataclass(slots=True)
 class Settings:
     host: str
     port: int
@@ -89,8 +97,7 @@ class Settings:
     headless: bool
     timeout: int
     vinted_auto_login: bool
-    vinted_email: str
-    vinted_password: str
+    vinted_accounts: tuple[VintedAccount, ...]
     vinted_login_interval_hours: int
     vinted_login_on_start: bool
 
@@ -113,11 +120,29 @@ def settings_from_options(addon_options: dict[str, Any]) -> Settings:
             parse_int(os.environ.get("FEDEX_SCRAPER_TIMEOUT"), 45),
         ),
         vinted_auto_login=parse_bool(addon_options.get("vinted_auto_login"), False),
-        vinted_email=str(addon_options.get("vinted_email") or os.environ.get("VINTED_EMAIL") or ""),
-        vinted_password=str(addon_options.get("vinted_password") or os.environ.get("VINTED_PASSWORD") or ""),
+        vinted_accounts=vinted_accounts_from_options(addon_options),
         vinted_login_interval_hours=parse_int(addon_options.get("vinted_login_interval_hours"), 22),
         vinted_login_on_start=parse_bool(addon_options.get("vinted_login_on_start"), True),
     )
+
+
+def vinted_accounts_from_options(addon_options: dict[str, Any]) -> tuple[VintedAccount, ...]:
+    raw_accounts: list[tuple[str, str, str]] = []
+    for key, email_option, password_option, email_env, password_env in (
+        ("account_1", "vinted_email", "vinted_password", "VINTED_EMAIL", "VINTED_PASSWORD"),
+        ("account_2", "vinted_email_2", "vinted_password_2", "VINTED_EMAIL_2", "VINTED_PASSWORD_2"),
+    ):
+        email = str(addon_options.get(email_option) or os.environ.get(email_env) or "").strip()
+        password = str(addon_options.get(password_option) or os.environ.get(password_env) or "")
+        if email and password:
+            raw_accounts.append((key, email, password))
+
+    accounts: list[VintedAccount] = []
+    use_legacy_single_profile = len(raw_accounts) == 1 and raw_accounts[0][0] == "account_1"
+    for key, email, password in raw_accounts:
+        profile_dir = VINTED_PROFILE_DIR if use_legacy_single_profile else VINTED_PROFILE_DIR / key
+        accounts.append(VintedAccount(key=key, email=email, password=password, profile_dir=profile_dir))
+    return tuple(accounts)
 
 
 def load_addon_options(path: Path = ADDON_OPTIONS_PATH) -> dict[str, Any]:
@@ -183,7 +208,14 @@ async def vinted_login_status(request: web.Request) -> web.Response:
 
 
 async def vinted_login_refresh(request: web.Request) -> web.Response:
-    result = await refresh_vinted_login(request.app, reason="manual")
+    account_key = None
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        account_key = str(payload.get("account") or payload.get("account_key") or "").strip() or None
+    result = await refresh_vinted_login(request.app, reason="manual", account_key=account_key)
     return web.json_response(result)
 
 
@@ -203,16 +235,17 @@ async def track(request: web.Request) -> web.Response:
     tracking_url = str(payload.get("tracking_url") or "").strip() or default_tracking_url(carrier, tracking_code)
     timeout = request.app["settings"].timeout
     try:
+        browser = await get_shared_browser(request.app)
         if carrier == "chronopost":
             scrape = scrape_chronopost(
-                request.app["browser"],
+                browser,
                 tracking_code=tracking_code,
                 tracking_url=tracking_url,
                 timeout=timeout,
             )
         else:
             scrape = scrape_fedex(
-                request.app["browser"],
+                browser,
                 tracking_code=tracking_code,
                 tracking_url=tracking_url,
                 timeout=timeout,
@@ -229,6 +262,9 @@ async def track(request: web.Request) -> web.Response:
             redact_tracking_code(tracking_code),
         )
         result = error_update(tracking_code, tracking_url, f"scraper_timeout_{timeout}s", carrier=carrier)
+    except PlaywrightError as err:
+        LOG.warning("%s browser failed for %s: %s", carrier_label(carrier), redact_tracking_code(tracking_code), err)
+        result = error_update(tracking_code, tracking_url, "browser_error", carrier=carrier)
     LOG.info(
         "%s tracking %s -> status=%s error=%s source=%s",
         carrier_label(carrier),
@@ -1148,18 +1184,30 @@ def error_update(
 
 
 def vinted_configured(settings: Settings) -> bool:
-    return bool(settings.vinted_email and settings.vinted_password)
+    return bool(settings.vinted_accounts)
 
 
 def vinted_status_payload(app: web.Application) -> dict[str, Any]:
     settings = app["settings"]
     state = dict(app.get("vinted_login_state") or {})
+    account_states = dict(app.get("vinted_login_states") or {})
+    accounts = [
+        {
+            "key": account.key,
+            "configured": True,
+            "profile_exists": account.profile_dir.exists(),
+            "state": account_states.get(account.key, {"status": "pending", "updated_at": None}),
+        }
+        for account in settings.vinted_accounts
+    ]
     return {
         "auto_login": settings.vinted_auto_login,
         "configured": vinted_configured(settings),
-        "profile_exists": VINTED_PROFILE_DIR.exists(),
+        "account_count": len(settings.vinted_accounts),
+        "profile_exists": any(account["profile_exists"] for account in accounts),
         "interval_hours": settings.vinted_login_interval_hours,
         "state": state,
+        "accounts": accounts,
     }
 
 
@@ -1174,24 +1222,48 @@ def vinted_login_blocker(text: str) -> str:
     return ""
 
 
-async def refresh_vinted_login(app: web.Application, *, reason: str) -> dict[str, Any]:
+async def refresh_vinted_login(
+    app: web.Application,
+    *,
+    reason: str,
+    account_key: str | None = None,
+) -> dict[str, Any]:
     settings: Settings = app["settings"]
     if not settings.vinted_auto_login:
-        return set_vinted_login_state(app, status="disabled", reason=reason)
+        return set_vinted_login_summary(app, status="disabled", reason=reason, accounts={})
     if not vinted_configured(settings):
-        return set_vinted_login_state(app, status="missing_credentials", reason=reason)
+        return set_vinted_login_summary(app, status="missing_credentials", reason=reason, accounts={})
+
+    accounts = list(settings.vinted_accounts)
+    if account_key:
+        accounts = [account for account in accounts if account.key == account_key]
+        if not accounts:
+            return set_vinted_login_summary(app, status="unknown_account", reason=reason, accounts={})
 
     lock: asyncio.Lock = app["vinted_login_lock"]
     async with lock:
-        return await run_vinted_login(app, reason=reason)
+        results = {}
+        for account in accounts:
+            results[account.key] = await run_vinted_login(app, reason=reason, account=account)
+        return set_vinted_login_summary(
+            app,
+            status=aggregate_vinted_status(results),
+            reason=reason,
+            accounts=results,
+        )
 
 
-async def run_vinted_login(app: web.Application, *, reason: str) -> dict[str, Any]:
+async def run_vinted_login(
+    app: web.Application,
+    *,
+    reason: str,
+    account: VintedAccount,
+) -> dict[str, Any]:
     settings: Settings = app["settings"]
     playwright = app["playwright"]
-    VINTED_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    account.profile_dir.mkdir(parents=True, exist_ok=True)
     context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(VINTED_PROFILE_DIR),
+        user_data_dir=str(account.profile_dir),
         headless=settings.headless,
         locale="nl-NL",
         args=["--disable-dev-shm-usage"],
@@ -1201,15 +1273,26 @@ async def run_vinted_login(app: web.Application, *, reason: str) -> dict[str, An
         await page.goto(VINTED_HOME, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
         await dismiss_vinted_overlays(page)
         if await vinted_page_looks_logged_in(page):
-            return set_vinted_login_state(app, status="ok", reason=reason, detail="already_logged_in")
+            return set_vinted_login_state(
+                app,
+                account=account,
+                status="ok",
+                reason=reason,
+                detail="already_logged_in",
+            )
 
         await page.goto(VINTED_LOGIN_URL, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
         await dismiss_vinted_overlays(page)
-        filled = await fill_vinted_credentials(page, settings)
+        filled = await fill_vinted_credentials(page, account)
         if not filled:
             text = await safe_body_text(page)
             blocker = vinted_login_blocker(text)
-            return set_vinted_login_state(app, status=blocker or "login_form_not_found", reason=reason)
+            return set_vinted_login_state(
+                app,
+                account=account,
+                status=blocker or "login_form_not_found",
+                reason=reason,
+            )
 
         try:
             await page.wait_for_load_state("networkidle", timeout=min(settings.timeout * 1000, 15000))
@@ -1220,13 +1303,25 @@ async def run_vinted_login(app: web.Application, *, reason: str) -> dict[str, An
         text = await safe_body_text(page)
         blocker = vinted_login_blocker(text)
         if blocker:
-            return set_vinted_login_state(app, status=blocker, reason=reason)
+            return set_vinted_login_state(app, account=account, status=blocker, reason=reason)
         if await vinted_page_looks_logged_in(page):
-            return set_vinted_login_state(app, status="ok", reason=reason, detail="submitted_credentials")
-        return set_vinted_login_state(app, status="login_required", reason=reason)
+            return set_vinted_login_state(
+                app,
+                account=account,
+                status="ok",
+                reason=reason,
+                detail="submitted_credentials",
+            )
+        return set_vinted_login_state(app, account=account, status="login_required", reason=reason)
     except PlaywrightError as err:
         LOG.warning("Vinted login refresh failed: %s", err)
-        return set_vinted_login_state(app, status="playwright_error", reason=reason, detail=str(err)[:160])
+        return set_vinted_login_state(
+            app,
+            account=account,
+            status="playwright_error",
+            reason=reason,
+            detail=str(err)[:160],
+        )
     finally:
         await context.close()
 
@@ -1247,7 +1342,7 @@ async def dismiss_vinted_overlays(page) -> None:
             continue
 
 
-async def fill_vinted_credentials(page, settings: Settings) -> bool:
+async def fill_vinted_credentials(page, account: VintedAccount) -> bool:
     email_filled = await fill_first_locator(
         page,
         (
@@ -1257,7 +1352,7 @@ async def fill_vinted_credentials(page, settings: Settings) -> bool:
             'input[name="username"]',
             'input[autocomplete="username"]',
         ),
-        settings.vinted_email,
+        account.email,
     )
     password_filled = await fill_first_locator(
         page,
@@ -1266,7 +1361,7 @@ async def fill_vinted_credentials(page, settings: Settings) -> bool:
             'input[name="password"]',
             'input[autocomplete="current-password"]',
         ),
-        settings.vinted_password,
+        account.password,
     )
     if not (email_filled and password_filled):
         return False
@@ -1325,6 +1420,7 @@ async def safe_body_text(page) -> str:
 def set_vinted_login_state(
     app: web.Application,
     *,
+    account: VintedAccount,
     status: str,
     reason: str,
     detail: str | None = None,
@@ -1336,13 +1432,49 @@ def set_vinted_login_state(
     }
     if detail:
         state["detail"] = detail
-    app["vinted_login_state"] = state
-    LOG.info("Vinted login refresh -> status=%s reason=%s", status, reason)
+    states = dict(app.get("vinted_login_states") or {})
+    states[account.key] = state
+    app["vinted_login_states"] = states
+    LOG.info("Vinted login refresh -> account=%s status=%s reason=%s", account.key, status, reason)
     return state
+
+
+def set_vinted_login_summary(
+    app: web.Application,
+    *,
+    status: str,
+    reason: str,
+    accounts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if accounts:
+        state["accounts"] = accounts
+    app["vinted_login_state"] = state
+    LOG.info("Vinted login summary -> status=%s reason=%s accounts=%s", status, reason, len(accounts))
+    return state
+
+
+def aggregate_vinted_status(accounts: dict[str, dict[str, Any]]) -> str:
+    statuses = [str(state.get("status") or "") for state in accounts.values()]
+    if not statuses:
+        return "missing_credentials"
+    if all(status == "ok" for status in statuses):
+        return "ok"
+    if any(status == "ok" for status in statuses):
+        return "partial_success"
+    unique_statuses = {status for status in statuses if status}
+    if len(unique_statuses) == 1:
+        return unique_statuses.pop()
+    return "attention_required"
 
 
 async def start_vinted_login_task(app: web.Application) -> None:
     app["vinted_login_lock"] = asyncio.Lock()
+    app["vinted_login_states"] = {}
     settings: Settings = app["settings"]
     if not settings.vinted_auto_login:
         app["vinted_login_state"] = {"status": "disabled", "updated_at": None}
@@ -1353,6 +1485,9 @@ async def start_vinted_login_task(app: web.Application) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         return
+    app["vinted_login_states"] = {
+        account.key: {"status": "pending", "updated_at": None} for account in settings.vinted_accounts
+    }
     app["vinted_login_task"] = asyncio.create_task(vinted_login_loop(app))
 
 
@@ -1377,11 +1512,32 @@ async def vinted_login_loop(app: web.Application) -> None:
 
 
 async def start_browser(app: web.Application) -> None:
-    settings = app["settings"]
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(headless=settings.headless)
     app["playwright"] = playwright
-    app["browser"] = browser
+    app["browser"] = None
+    app["browser_lock"] = asyncio.Lock()
+
+
+async def get_shared_browser(app: web.Application) -> Browser:
+    settings = app["settings"]
+    browser = app.get("browser")
+    if browser and browser.is_connected():
+        return browser
+
+    lock: asyncio.Lock = app["browser_lock"]
+    async with lock:
+        browser = app.get("browser")
+        if browser and browser.is_connected():
+            return browser
+        playwright = app["playwright"]
+        app["browser"] = await asyncio.wait_for(
+            playwright.chromium.launch(
+                headless=settings.headless,
+                args=["--disable-dev-shm-usage"],
+            ),
+            timeout=min(max(settings.timeout, 10), 30),
+        )
+        return app["browser"]
 
 
 async def stop_browser(app: web.Application) -> None:

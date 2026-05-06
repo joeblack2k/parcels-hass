@@ -20,6 +20,7 @@ def test_tracking_scraper_addon_metadata_is_present():
     assert config["schema"]["headless"] == "bool"
     assert config["schema"]["vinted_auto_login"] == "bool"
     assert config["schema"]["vinted_password"] == "password?"
+    assert config["schema"]["vinted_password_2"] == "password?"
 
 
 def test_tracking_scraper_addon_has_runtime_files():

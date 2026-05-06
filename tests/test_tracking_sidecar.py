@@ -12,6 +12,7 @@ def test_sidecar_settings_include_disabled_vinted_auto_login_by_default():
     assert settings.vinted_auto_login is False
     assert settings.vinted_login_on_start is True
     assert settings.vinted_login_interval_hours == 22
+    assert settings.vinted_accounts == ()
     assert vinted_configured(settings) is False
 
 
@@ -29,6 +30,26 @@ def test_sidecar_settings_enable_vinted_auto_login_from_options():
     assert settings.vinted_auto_login is True
     assert settings.vinted_login_on_start is False
     assert settings.vinted_login_interval_hours == 12
+    assert len(settings.vinted_accounts) == 1
+    assert settings.vinted_accounts[0].key == "account_1"
+    assert str(settings.vinted_accounts[0].profile_dir).endswith("/vinted")
+    assert vinted_configured(settings) is True
+
+
+def test_sidecar_settings_support_two_vinted_accounts():
+    settings = settings_from_options(
+        {
+            "vinted_auto_login": True,
+            "vinted_email": "first@example.test",
+            "vinted_password": "secret-1",
+            "vinted_email_2": "second@example.test",
+            "vinted_password_2": "secret-2",
+        }
+    )
+
+    assert [account.key for account in settings.vinted_accounts] == ["account_1", "account_2"]
+    assert str(settings.vinted_accounts[0].profile_dir).endswith("/vinted/account_1")
+    assert str(settings.vinted_accounts[1].profile_dir).endswith("/vinted/account_2")
     assert vinted_configured(settings) is True
 
 
