@@ -272,3 +272,55 @@ def test_vinted_sidecar_pickup_keeps_location_and_uses_vinted_source():
     assert record["pickup_location"] == "DROOMVISIE Schoolstraat 109A Voorschoten"
     assert record["pickup_code"] == "034049"
     assert record["source"] == "vinted_sidecar_cross_reference"
+
+
+def test_vinted_dpd_manual_link_merges_platform_and_carrier_numbers():
+    record = apply_vinted_cross_reference(
+        {
+            "carrier": "vinted",
+            "shop": "Vinted",
+            "tracking_code": "1778051829299958",
+            "status": "in_transit",
+            "expected_date": "2026-05-11",
+            "tracking_status_text": "5 artikelen - verwacht 2026-05-11 t/m 2026-05-13",
+            "source": "vinted_sidecar_manual_link",
+            "confidence": "high",
+            "extra": {
+                "vinted_id": "1778051829299958",
+                "vinted_tracking_code": "1778051829299958",
+                "vinted_item_title": "5 artikelen",
+                "vinted_other_party": "bruijna1981",
+                "expected_date_end": "2026-05-13",
+                "carrier_tracking": {
+                    "carrier": "dpd",
+                    "tracking_code": "34343180322236",
+                    "tracking_url": "https://www.dpd.com/nl/nl/ontvangen/volgen/?parcelNumber=34343180322236",
+                },
+                "tracking_events": [
+                    {"status": "Onderweg", "timestamp": "2026-05-06T14:49:00+02:00"},
+                ],
+            },
+        },
+        {
+            "dpd:34343180322236": {
+                "key": "dpd:34343180322236",
+                "carrier": "dpd",
+                "shop": "Aissatou Drame",
+                "tracking_code": "34343180322236",
+                "status": "in_transit",
+                "source": "imap_corrected",
+                "confidence": "high",
+            }
+        },
+    )
+
+    assert record["key"] == "dpd:34343180322236"
+    assert record["carrier"] == "dpd"
+    assert record["tracking_code"] == "34343180322236"
+    assert record["shop"] == "Aissatou Drame"
+    assert record["expected_date"] == "2026-05-11"
+    assert record["source"] == "vinted_sidecar_cross_reference"
+    assert record["extra"]["vinted_tracking_code"] == "1778051829299958"
+    assert record["extra"]["vinted_item_title"] == "5 artikelen"
+    assert record["extra"]["expected_date_end"] == "2026-05-13"
+    assert record["extra"]["tracking_events"][0]["status"] == "Onderweg"

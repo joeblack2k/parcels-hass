@@ -11,6 +11,7 @@ from addons.parcels_fedex_scraper.app.main import (
     vinted_login_needs_manual_attention,
     vinted_package_from_conversation,
     vinted_page_looks_logged_out,
+    vinted_carrier_tracking_from_values,
 )
 
 
@@ -130,6 +131,20 @@ def test_vinted_text_extracts_pickup_and_chronopost_reference():
         "carrier": "chronopost",
         "tracking_code": "XU152297803JF",
         "tracking_url": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF",
+    }
+
+
+def test_vinted_carrier_reference_supports_dpd():
+    reference = vinted_carrier_tracking_from_values(
+        carrier="DPD",
+        tracking_code="34343180322236",
+        text="",
+    )
+
+    assert reference == {
+        "carrier": "dpd",
+        "tracking_code": "34343180322236",
+        "tracking_url": "https://www.dpd.com/nl/nl/ontvangen/volgen/?parcelNumber=34343180322236",
     }
 
 

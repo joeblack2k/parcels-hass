@@ -2980,6 +2980,10 @@ def vinted_carrier_tracking_from_values(
 ) -> dict[str, str]:
     text_reference = vinted_carrier_tracking("\n".join(value for value in (carrier or "", tracking_code or "", text) if value))
     if text_reference:
+        if not text_reference.get("tracking_url"):
+            tracking_url = tracking_url_for_vinted_carrier(text_reference["carrier"], text_reference["tracking_code"])
+            if tracking_url:
+                text_reference["tracking_url"] = tracking_url
         return text_reference
     normalized = normalize_vinted_carrier(carrier)
     code = re.sub(r"[^A-Z0-9]", "", str(tracking_code or "").upper())
@@ -3021,6 +3025,8 @@ def tracking_url_for_vinted_carrier(carrier: str, tracking_code: str) -> str:
         return f"https://jouw.postnl.nl/track-and-trace/{encoded}"
     if carrier == "gls":
         return f"https://gls-group.eu/NL/nl/pakket-volgen?match={encoded}"
+    if carrier == "dpd":
+        return f"https://www.dpd.com/nl/nl/ontvangen/volgen/?parcelNumber={encoded}"
     if carrier == "fedex":
         return FEDEX_TRACKING_PAGE.format(tracking_code=encoded)
     return ""
@@ -3291,6 +3297,7 @@ def vinted_carrier_tracking(text: str) -> dict[str, str]:
         ("dhl", r"\b(?:JJD[A-Z0-9]{12,32}|3S[A-Z0-9]{8,24})\b", ("dhl", "dhlecommerce", "dhl parcel")),
         ("postnl", r"\b3S[A-Z0-9]{8,24}\b", ("postnl", "post nl")),
         ("gls", r"\b[A-Z0-9]{8,16}\b", ("gls",)),
+        ("dpd", r"\b[A-Z0-9]{10,24}\b", ("dpd",)),
     )
     for carrier, pattern, keywords in patterns:
         if not any(keyword in folded for keyword in keywords):
