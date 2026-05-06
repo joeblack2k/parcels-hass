@@ -83,6 +83,44 @@ def test_vinted_pickup_code():
     assert "HEMA" in records[0]["pickup_location"]
 
 
+def test_vinted_order_confirmation_before_shipment_is_ignored():
+    records = parse_email(
+        subject="Je bon voor Bundel: 5 artikelen",
+        sender="Team Vinted <no-reply@vinted.nl>",
+        text=(
+            "Je betaling is ontvangen. Hieronder vind je de bestelbevestiging. "
+            "Verkoper bruijna1981. Transactienummer 19631936553. "
+            "We laten het je weten zodra bruijna1981 Bundel: 5 artikelen heeft verzonden. "
+            "Verkopers hebben tot 7 dagen de tijd om de bestelling te versturen."
+        ),
+        today=date(2026, 5, 6),
+    )
+
+    assert records == []
+
+
+def test_dpd_to_pickup_point_is_in_transit_without_pickup_ready_location():
+    records = parse_email(
+        subject="Je pakket is binnen 1 tot 3 werkdagen in het DPD Pakketpunt",
+        sender="DPD Pakketservice <notificaties@dpd.nl>",
+        text=(
+            "Jouw pakket is door ons ontvangen en gaat naar het door jou gekozen pakketpunt. "
+            "Sortering bij DPD. Pakketnummer: 34343180322236. "
+            "Pakketreferentie: 23686884587. Pakketpunt. "
+            "Op de dag van bezorging informeren wij je wanneer je bestelling bij jouw Pakketpunt klaar ligt "
+            "om opgehaald te worden. Pakketpunt Afzender Aissatou Drame."
+        ),
+        today=date(2026, 5, 6),
+    )
+
+    assert len(records) == 1
+    assert records[0]["carrier"] == "dpd"
+    assert records[0]["tracking_code"] == "34343180322236"
+    assert records[0]["status"] == "in_transit"
+    assert records[0]["pickup_location"] is None
+    assert records[0]["shop"] == "Aissatou Drame"
+
+
 def test_amazon_weekday_delivery_without_false_pickup():
     records = parse_email(
         subject="Besteld: Slipstop en nog 2 items",

@@ -216,6 +216,8 @@ def parse_email(
     status = _extract_status(combined, expected_date, today)
     pickup_code = _extract_pickup_code(combined, status)
     pickup_location = _extract_pickup_location(combined)
+    if status != STATUS_READY_FOR_PICKUP:
+        pickup_location = None
     if status == STATUS_READY_FOR_PICKUP:
         window_start, window_end = (None, None)
     shop = _extract_shop(combined, sender_clean, carrier)
@@ -272,6 +274,8 @@ def _should_ignore_email(subject: str, sender: str, text: str) -> bool:
             return True
         if _looks_like_amazon_order_only_mail(lowered):
             return True
+    if ("vinted" in sender_lower or "vinted" in lowered) and _looks_like_vinted_order_only_mail(lowered):
+        return True
     if "vinted" in sender_lower and any(
         term in lowered
         for term in (
@@ -296,6 +300,28 @@ def _should_ignore_email(subject: str, sender: str, text: str) -> bool:
     ):
         return True
     return False
+
+
+def _looks_like_vinted_order_only_mail(lowered: str) -> bool:
+    if not any(
+        term in lowered
+        for term in (
+            "je betaling is ontvangen",
+            "bestelbevestiging",
+            "transactienummer",
+            "je bon voor",
+        )
+    ):
+        return False
+    return any(
+        term in lowered
+        for term in (
+            "we laten het je weten zodra",
+            "verkopers hebben tot",
+            "zodra het pakket is verzonden",
+            "zodra de bestelling is verzonden",
+        )
+    )
 
 
 def _looks_like_amazon_return_mail(lowered: str) -> bool:
@@ -781,7 +807,8 @@ def _extract_pickup_location(value: str) -> str | None:
 def _extract_shop(value: str, sender: str, carrier: str) -> str | None:
     lowered = value.lower()
     contextual_patterns = (
-        r"(?i)\b(?:zending|pakket)\s+van\s+(.+?)\s+is\s+(?:onderweg|verzonden|aangemeld)\b",
+        r"(?i)\b(?:zending|pakket)\s+van\s+(.+?)\s+is\s+(?:onderweg|verzonden|aangemeld|afgeleverd|bezorgd)\b",
+        r"(?i)\bafgeleverd:\s*(?:je\s+)?pakket\s+van\s+(.+?)(?:[.:\n]|$)",
         r"(?i)\bshipment\s+from\s+(.+?)\s+is\s+(?:on\s+the\s+way|in\s+transit|shipped)\b",
     )
     for pattern in contextual_patterns:
@@ -796,8 +823,9 @@ def _extract_shop(value: str, sender: str, carrier: str) -> str | None:
             return shop
 
     patterns = (
-        r"(?i)\bvan[:\s]+([A-Z0-9][A-Za-z0-9 .&'-]{1,50})",
-        r"(?i)\bfrom[:\s]+([A-Z0-9][A-Za-z0-9 .&'-]{1,50})",
+        r"(?i)\bafzender\s+([A-Z0-9][A-Za-z0-9 .&'-]{1,50})",
+        r"(?i)\bvan:\s*([A-Z0-9][A-Za-z0-9 .&'-]{1,50})",
+        r"(?i)\bfrom:\s*([A-Z0-9][A-Za-z0-9 .&'-]{1,50})",
     )
     for pattern in patterns:
         match = re.search(pattern, value)
