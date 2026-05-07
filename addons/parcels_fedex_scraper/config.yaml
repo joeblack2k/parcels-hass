@@ -1,5 +1,5 @@
 name: Parcels Tracking Scraper
-version: "0.1.13"
+version: "0.1.16"
 slug: parcels_fedex_scraper
 description: Experimental local tracking scraper for Parcels for Home Assistant.
 url: https://github.com/joeblack2k/parcels-hass/tree/main/addons/parcels_fedex_scraper
@@ -11,8 +11,12 @@ init: false
 stage: experimental
 ports:
   8765/tcp: null
+  5900/tcp: null
+  6080/tcp: null
 ports_description:
   8765/tcp: Optional HTTP API for the parcels-hass tracking scraper bridge.
+  5900/tcp: Optional VNC access for manual Vinted profile login.
+  6080/tcp: Optional noVNC web access for manual Vinted profile login.
 watchdog: http://[HOST]:[PORT:8765]/health
 options:
   headless: true
@@ -20,6 +24,7 @@ options:
   vinted_auto_login: false
   vinted_login_on_start: true
   vinted_login_interval_hours: 6
+  vinted_browser_ui: false
 schema:
   scraper_token: password?
   headless: bool
@@ -27,6 +32,8 @@ schema:
   vinted_auto_login: bool
   vinted_login_on_start: bool
   vinted_login_interval_hours: int(1,168)
+  vinted_browser_ui: bool
+  vinted_browser_ui_password: password?
   vinted_email: str?
   vinted_password: password?
   vinted_session_cookie: password?

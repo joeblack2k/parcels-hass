@@ -13,7 +13,10 @@ WORKDIR /app
 COPY app ./app
 COPY run.sh /run.sh
 
-RUN pip install --no-cache-dir "aiohttp>=3.10,<4" "cloudscraper==1.2.71" "playwright==1.56.0" \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fluxbox novnc websockify x11vnc xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir "aiohttp>=3.10,<4" "cloudscraper==1.2.71" "playwright==1.56.0" \
     && chmod a+x /run.sh
 
 ENV HOST=0.0.0.0
@@ -22,5 +25,7 @@ ENV FEDEX_SCRAPER_HEADLESS=true
 ENV FEDEX_SCRAPER_TIMEOUT=45
 
 EXPOSE 8765
+EXPOSE 5900
+EXPOSE 6080
 
 CMD ["/run.sh"]

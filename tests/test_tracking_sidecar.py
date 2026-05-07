@@ -19,6 +19,8 @@ from addons.parcels_fedex_scraper.app.main import (
     vinted_login_needs_manual_attention,
     vinted_login_attempt_timeout,
     vinted_login_retry_cooldown_remaining,
+    vinted_browser_launch_timeout,
+    vinted_chromium_args,
     vinted_package_from_conversation,
     vinted_page_looks_logged_out,
     vinted_text_looks_register_form,
@@ -32,6 +34,7 @@ def test_sidecar_settings_include_disabled_vinted_auto_login_by_default():
     assert settings.vinted_auto_login is False
     assert settings.vinted_login_on_start is True
     assert settings.vinted_login_interval_hours == 6
+    assert settings.vinted_browser_ui is False
     assert settings.vinted_accounts == ()
     assert vinted_configured(settings) is False
 
@@ -44,12 +47,14 @@ def test_sidecar_settings_enable_vinted_auto_login_from_options():
             "vinted_password": "secret",
             "vinted_login_interval_hours": 12,
             "vinted_login_on_start": False,
+            "vinted_browser_ui": True,
         }
     )
 
     assert settings.vinted_auto_login is True
     assert settings.vinted_login_on_start is False
     assert settings.vinted_login_interval_hours == 12
+    assert settings.vinted_browser_ui is True
     assert len(settings.vinted_accounts) == 1
     assert settings.vinted_accounts[0].key == "account_1"
     assert settings.vinted_accounts[0].session_cookie == ""
@@ -61,6 +66,12 @@ def test_vinted_login_attempt_timeout_is_bounded_for_small_haos_hosts():
     assert vinted_login_attempt_timeout(settings_from_options({"timeout": 10})) == 25
     assert vinted_login_attempt_timeout(settings_from_options({"timeout": 45})) == 60
     assert vinted_login_attempt_timeout(settings_from_options({"timeout": 90})) == 75
+
+
+def test_vinted_browser_launch_timeout_stays_short():
+    assert vinted_browser_launch_timeout(settings_from_options({"timeout": 10})) == 10
+    assert vinted_browser_launch_timeout(settings_from_options({"timeout": 45})) == 22
+    assert vinted_browser_launch_timeout(settings_from_options({"timeout": 90})) == 25
 
 
 def test_vinted_login_retry_cooldown_avoids_immediate_browser_hammering():
@@ -201,6 +212,13 @@ def test_vinted_register_form_is_not_used_as_login_form():
 def test_vinted_login_entry_points_use_current_public_auth_page():
     assert "https://www.vinted.nl/member/signup/select_type?ref_url=%2F" in VINTED_LOGIN_URLS
     assert all("/member/login" not in url for url in VINTED_LOGIN_URLS)
+
+
+def test_vinted_chromium_args_reduce_obvious_automation_signals():
+    args = vinted_chromium_args()
+
+    assert "--disable-dev-shm-usage" in args
+    assert "--disable-blink-features=AutomationControlled" in args
 
 
 def test_vinted_text_extracts_pickup_and_chronopost_reference():

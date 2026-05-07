@@ -22,6 +22,8 @@ Supported carriers:
 | `vinted_auto_login` | `false` | Periodically refreshes a Vinted browser session when credentials are configured. |
 | `vinted_login_on_start` | `true` | Runs one Vinted login refresh when the add-on starts. |
 | `vinted_login_interval_hours` | `6` | Delay between automatic Vinted login/session refreshes. |
+| `vinted_browser_ui` | `false` | Starts an optional Xvfb/noVNC browser desktop for manual Vinted profile login. |
+| `vinted_browser_ui_password` | not set | Optional VNC password for the manual browser desktop. |
 | `vinted_email` | not set | First Vinted account e-mail; keep this local in the add-on options. |
 | `vinted_password` | not set | First Vinted password; stored by Home Assistant as a password option. |
 | `vinted_session_cookie` | not set | Optional first-account Vinted browser session cookie. Prefer this when Vinted blocks password auth. |
@@ -60,11 +62,20 @@ accepts `{"account": "account_1", "cookie": "..."}` or a Chrome-style
 `cookies` list. It stores only a sanitized Vinted cookie string in
 `/data/vinted_sessions.json` and marks that account usable for API refreshes.
 
+When Vinted blocks automated password login, enable `vinted_browser_ui`, map
+port `6080`, and open `POST /browser/vinted/open` for the account you want to
+repair. Log in through noVNC, then call `POST /browser/vinted/close`; the add-on
+stores the refreshed profile cookies locally and the normal parcel mirror can use
+that same profile. The browser UI is intended for private LAN use only.
+
 Useful endpoints:
 
 - `GET /login/vinted/status`
 - `POST /login/vinted`
 - `POST /login/vinted/session`
+- `GET /browser/vinted/status`
+- `POST /browser/vinted/open`
+- `POST /browser/vinted/close`
 - `GET /parcels/vinted`
 - `POST /parcels/vinted`
 

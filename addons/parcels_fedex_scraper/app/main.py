@@ -38,6 +38,9 @@ VINTED_LOGIN_URLS = (
     VINTED_SIGNUP_LOGIN_URL,
 )
 VINTED_LOGIN_RETRY_COOLDOWN_SECONDS = 20 * 60
+VINTED_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+"""
 VINTED_PARCEL_PATHS = (
     "/inbox",
     "/my_purchases",
@@ -211,6 +214,7 @@ class Settings:
     vinted_accounts: tuple[VintedAccount, ...]
     vinted_login_interval_hours: int
     vinted_login_on_start: bool
+    vinted_browser_ui: bool
 
 
 def settings_from_env() -> Settings:
@@ -234,6 +238,7 @@ def settings_from_options(addon_options: dict[str, Any]) -> Settings:
         vinted_accounts=vinted_accounts_from_options(addon_options),
         vinted_login_interval_hours=parse_int(addon_options.get("vinted_login_interval_hours"), 6),
         vinted_login_on_start=parse_bool(addon_options.get("vinted_login_on_start"), True),
+        vinted_browser_ui=parse_bool(addon_options.get("vinted_browser_ui"), False),
     )
 
 
@@ -334,6 +339,7 @@ async def health(request: web.Request) -> web.Response:
             "started_at": request.app.get("started_at"),
             "headless": settings.headless,
             "timeout": settings.timeout,
+            "vinted_browser_ui": settings.vinted_browser_ui,
             "vinted": vinted_status_payload(request.app),
         }
     )
@@ -397,6 +403,151 @@ async def vinted_session_update(request: web.Request) -> web.Response:
             "account": account_key,
             "cookie_names": persisted.get("cookie_names", []),
             "stored": persisted.get("stored", False),
+        }
+    )
+
+
+def vinted_account_by_key(settings: Settings, account_key: str) -> VintedAccount | None:
+    for account in settings.vinted_accounts:
+        if account.key == account_key:
+            return account
+    return None
+
+
+async def vinted_browser_ui_status(request: web.Request) -> web.Response:
+    settings: Settings = request.app["settings"]
+    contexts = request.app.get("vinted_ui_contexts") if isinstance(request.app.get("vinted_ui_contexts"), dict) else {}
+    sessions = []
+    for account_key, entry in contexts.items():
+        page = entry.get("page")
+        page_url = ""
+        if page:
+            try:
+                page_url = page.url
+            except PlaywrightError:
+                page_url = ""
+        sessions.append(
+            {
+                "account": account_key,
+                "opened_at": entry.get("opened_at"),
+                "page_url": page_url,
+            }
+        )
+    return web.json_response(
+        {
+            "enabled": settings.vinted_browser_ui,
+            "display": os.environ.get("DISPLAY", ""),
+            "novnc_path": "/vnc.html?autoconnect=1&resize=scale",
+            "sessions": sessions,
+        }
+    )
+
+
+async def vinted_browser_ui_open(request: web.Request) -> web.Response:
+    settings: Settings = request.app["settings"]
+    if not settings.vinted_browser_ui:
+        return web.json_response({"success": False, "error": "browser_ui_disabled"}, status=409)
+    if not os.environ.get("DISPLAY"):
+        return web.json_response({"success": False, "error": "display_unavailable"}, status=503)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    account_key = "account_1"
+    if isinstance(payload, dict):
+        account_key = str(payload.get("account") or payload.get("account_key") or account_key).strip() or account_key
+    account = vinted_account_by_key(settings, account_key)
+    if not account:
+        return web.json_response({"success": False, "error": "unknown_account"}, status=404)
+
+    contexts = request.app["vinted_ui_contexts"]
+    if account.key in contexts:
+        entry = contexts[account.key]
+        page = entry.get("page")
+        return web.json_response(
+            {
+                "success": True,
+                "account": account.key,
+                "already_open": True,
+                "page_url": page.url if page else "",
+                "novnc_path": "/vnc.html?autoconnect=1&resize=scale",
+            }
+        )
+
+    account.profile_dir.mkdir(parents=True, exist_ok=True)
+    playwright = request.app["playwright"]
+    context = await asyncio.wait_for(
+        playwright.chromium.launch_persistent_context(
+            user_data_dir=str(account.profile_dir),
+            headless=False,
+            locale="nl-NL",
+            args=vinted_chromium_args(),
+        ),
+        timeout=vinted_browser_launch_timeout(settings),
+    )
+    await prepare_vinted_context(context)
+    page = context.pages[0] if context.pages else await context.new_page()
+    await page.goto(VINTED_SIGNUP_LOGIN_URL, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
+    contexts[account.key] = {
+        "context": context,
+        "page": page,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return web.json_response(
+        {
+            "success": True,
+            "account": account.key,
+            "page_url": page.url,
+            "novnc_path": "/vnc.html?autoconnect=1&resize=scale",
+        }
+    )
+
+
+async def vinted_browser_ui_close(request: web.Request) -> web.Response:
+    settings: Settings = request.app["settings"]
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    account_key = "account_1"
+    if isinstance(payload, dict):
+        account_key = str(payload.get("account") or payload.get("account_key") or account_key).strip() or account_key
+    account = vinted_account_by_key(settings, account_key)
+    if not account:
+        return web.json_response({"success": False, "error": "unknown_account"}, status=404)
+
+    entry = request.app["vinted_ui_contexts"].pop(account.key, None)
+    if not entry:
+        return web.json_response({"success": False, "error": "not_open"}, status=404)
+
+    context = entry.get("context")
+    page = entry.get("page")
+    logged_in = False
+    if page:
+        try:
+            logged_in = await vinted_page_looks_logged_in(page)
+        except PlaywrightError:
+            logged_in = False
+    session = {"stored": False}
+    if logged_in and context:
+        session = await persist_vinted_context_session(account, context, source="manual_browser_ui")
+    if context:
+        await close_vinted_context(context)
+    state = set_vinted_login_state(
+        request.app,
+        account=account,
+        status="ok" if logged_in and session.get("stored") else "login_required",
+        reason="manual_browser_ui",
+        detail="session_stored" if logged_in and session.get("stored") else "manual_browser_not_logged_in",
+        session=session if session.get("stored") else stored_vinted_session_summary(account.key),
+    )
+    return web.json_response(
+        {
+            "success": True,
+            "account": account.key,
+            "logged_in": logged_in,
+            "stored": bool(session.get("stored")),
+            "state": state,
         }
     )
 
@@ -1780,6 +1931,31 @@ def vinted_login_retry_cooldown_remaining(
     return max(0, VINTED_LOGIN_RETRY_COOLDOWN_SECONDS - elapsed)
 
 
+def vinted_chromium_args() -> list[str]:
+    return [
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+
+async def prepare_vinted_context(context) -> None:
+    try:
+        await context.add_init_script(VINTED_STEALTH_INIT_SCRIPT)
+    except PlaywrightError:
+        pass
+
+
+def vinted_browser_launch_timeout(settings: Settings) -> int:
+    return max(10, min(int(settings.timeout / 2), 25))
+
+
+async def close_vinted_context(context) -> None:
+    try:
+        await asyncio.wait_for(context.close(), timeout=5)
+    except (TimeoutError, PlaywrightError, RuntimeError) as err:
+        LOG.warning("Vinted browser context close did not finish cleanly: %s", type(err).__name__)
+
+
 def fetch_vinted_api_records_sync(account: VintedAccount) -> dict[str, Any]:
     request_timeout = 8
     session_cookie = account.session_cookie or stored_vinted_session_cookie(account.key)
@@ -2022,12 +2198,17 @@ async def run_vinted_parcel_scrape(
 
     playwright = app["playwright"]
     account.profile_dir.mkdir(parents=True, exist_ok=True)
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(account.profile_dir),
-        headless=settings.headless,
-        locale="nl-NL",
-        args=["--disable-dev-shm-usage"],
+    context = None
+    context = await asyncio.wait_for(
+        playwright.chromium.launch_persistent_context(
+            user_data_dir=str(account.profile_dir),
+            headless=settings.headless,
+            locale="nl-NL",
+            args=vinted_chromium_args(),
+        ),
+        timeout=vinted_browser_launch_timeout(settings),
     )
+    await prepare_vinted_context(context)
     page = context.pages[0] if context.pages else await context.new_page()
     json_payloads: list[tuple[str, Any]] = []
     page_texts: list[tuple[str, str]] = []
@@ -2114,8 +2295,11 @@ async def run_vinted_parcel_scrape(
     except PlaywrightError as err:
         LOG.warning("Vinted parcel scrape failed for %s: %s", account.key, err)
         return {"status": "playwright_error", "records": [], "detail": str(err)[:160], "diagnostics": diagnostics}
+    except TimeoutError:
+        return {"status": "login_timeout", "records": [], "detail": "browser_launch_timeout", "diagnostics": diagnostics}
     finally:
-        await context.close()
+        if context:
+            await close_vinted_context(context)
 
 
 async def wait_for_vinted_settle(page, timeout: int) -> None:
@@ -2254,26 +2438,44 @@ async def refresh_vinted_login(
     async with lock:
         results = {}
         for account in accounts:
-            timeout = vinted_login_attempt_timeout(settings)
-            try:
-                results[account.key] = await asyncio.wait_for(
-                    run_vinted_login(app, reason=reason, account=account),
-                    timeout=timeout,
-                )
-            except TimeoutError:
-                results[account.key] = set_vinted_login_state(
-                    app,
-                    account=account,
-                    status="login_timeout",
-                    reason=reason,
-                    detail=f"timed out after {timeout}s",
-                )
+            results[account.key] = await run_vinted_login_bounded(app, reason=reason, account=account)
         return set_vinted_login_summary(
             app,
             status=aggregate_vinted_status(results),
             reason=reason,
             accounts=results,
         )
+
+
+async def run_vinted_login_bounded(
+    app: web.Application,
+    *,
+    reason: str,
+    account: VintedAccount,
+) -> dict[str, Any]:
+    timeout = vinted_login_attempt_timeout(app["settings"])
+    task = asyncio.create_task(run_vinted_login(app, reason=reason, account=account))
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except TimeoutError:
+        task.cancel()
+        asyncio.create_task(log_vinted_cancelled_login(task, account.key))
+        return set_vinted_login_state(
+            app,
+            account=account,
+            status="login_timeout",
+            reason=reason,
+            detail=f"timed out after {timeout}s",
+        )
+
+
+async def log_vinted_cancelled_login(task: asyncio.Task, account_key: str) -> None:
+    try:
+        await task
+    except asyncio.CancelledError:
+        LOG.info("Cancelled overdue Vinted login task for %s", account_key)
+    except Exception as err:
+        LOG.warning("Overdue Vinted login task for %s ended with %s", account_key, type(err).__name__)
 
 
 async def run_vinted_login(
@@ -2294,14 +2496,19 @@ async def run_vinted_login(
         )
     playwright = app["playwright"]
     account.profile_dir.mkdir(parents=True, exist_ok=True)
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(account.profile_dir),
-        headless=settings.headless,
-        locale="nl-NL",
-        args=["--disable-dev-shm-usage"],
-    )
-    page = context.pages[0] if context.pages else await context.new_page()
+    context = None
     try:
+        context = await asyncio.wait_for(
+            playwright.chromium.launch_persistent_context(
+                user_data_dir=str(account.profile_dir),
+                headless=settings.headless,
+                locale="nl-NL",
+                args=vinted_chromium_args(),
+            ),
+            timeout=vinted_browser_launch_timeout(settings),
+        )
+        await prepare_vinted_context(context)
+        page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(VINTED_HOME, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
         await dismiss_vinted_overlays(page)
         if await vinted_page_looks_logged_in(page):
@@ -2370,8 +2577,17 @@ async def run_vinted_login(
             reason=reason,
             detail=str(err)[:160],
         )
+    except TimeoutError:
+        return set_vinted_login_state(
+            app,
+            account=account,
+            status="login_timeout",
+            reason=reason,
+            detail="browser_launch_timeout",
+        )
     finally:
-        await context.close()
+        if context:
+            await close_vinted_context(context)
 
 
 async def dismiss_vinted_overlays(page) -> None:
@@ -2509,15 +2725,24 @@ async def fill_vinted_credentials(page, account: VintedAccount) -> bool:
     )
     if not (email_filled and password_filled):
         return False
+    await page.wait_for_timeout(random.randint(450, 900))
 
     for label in ("Verder", "Inloggen", "Log in", "Aanmelden", "Sign in", "Continue", "Doorgaan"):
         try:
-            await page.get_by_role("button", name=re.compile(label, re.IGNORECASE)).click(timeout=1500)
+            button = page.get_by_role("button", name=re.compile(label, re.IGNORECASE)).first
+            await button.scroll_into_view_if_needed(timeout=1500)
+            await button.hover(timeout=1500)
+            await page.wait_for_timeout(random.randint(120, 280))
+            await button.click(timeout=1500)
             return True
         except PlaywrightError:
             continue
     try:
-        await page.locator('button[type="submit"], input[type="submit"]').first.click(timeout=1500)
+        button = page.locator('button[type="submit"], input[type="submit"]').first
+        await button.scroll_into_view_if_needed(timeout=1500)
+        await button.hover(timeout=1500)
+        await page.wait_for_timeout(random.randint(120, 280))
+        await button.click(timeout=1500)
         return True
     except PlaywrightError:
         return False
@@ -2527,7 +2752,11 @@ async def fill_first_locator(page, selectors: tuple[str, ...], value: str) -> bo
     for selector in selectors:
         locator = page.locator(selector).first
         try:
-            await locator.fill(value, timeout=1500)
+            await locator.scroll_into_view_if_needed(timeout=1500)
+            await locator.click(timeout=1500)
+            await page.wait_for_timeout(random.randint(120, 260))
+            await locator.fill("", timeout=1500)
+            await locator.press_sequentially(value, delay=random.randint(35, 85), timeout=max(5000, len(value) * 250))
             return True
         except PlaywrightError:
             continue
@@ -3711,6 +3940,7 @@ async def start_browser(app: web.Application) -> None:
     app["playwright"] = playwright
     app["browser"] = None
     app["browser_lock"] = asyncio.Lock()
+    app["vinted_ui_contexts"] = {}
 
 
 async def get_shared_browser(app: web.Application) -> Browser:
@@ -3736,6 +3966,13 @@ async def get_shared_browser(app: web.Application) -> Browser:
 
 
 async def stop_browser(app: web.Application) -> None:
+    contexts = app.get("vinted_ui_contexts")
+    if isinstance(contexts, dict):
+        for entry in list(contexts.values()):
+            context = entry.get("context") if isinstance(entry, dict) else None
+            if context:
+                await close_vinted_context(context)
+        contexts.clear()
     browser = app.get("browser")
     if browser:
         await browser.close()
@@ -3752,6 +3989,9 @@ def create_app(settings: Settings | None = None) -> web.Application:
     app.router.add_get("/login/vinted/status", vinted_login_status)
     app.router.add_post("/login/vinted", vinted_login_refresh)
     app.router.add_post("/login/vinted/session", vinted_session_update)
+    app.router.add_get("/browser/vinted/status", vinted_browser_ui_status)
+    app.router.add_post("/browser/vinted/open", vinted_browser_ui_open)
+    app.router.add_post("/browser/vinted/close", vinted_browser_ui_close)
     app.router.add_get("/parcels/vinted", vinted_parcels)
     app.router.add_post("/parcels/vinted", vinted_parcels)
     app.router.add_post("/track", track)
