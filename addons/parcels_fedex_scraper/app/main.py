@@ -32,6 +32,12 @@ FEDEX_TRACKING_PAGE = "https://www.fedex.com/fedextrack/?trknbr={tracking_code}"
 CHRONOPOST_TRACKING_PAGE = "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT={tracking_code}"
 VINTED_HOME = "https://www.vinted.nl/"
 VINTED_LOGIN_URL = VINTED_HOME
+VINTED_SIGNUP_LOGIN_URL = "https://www.vinted.nl/member/signup/select_type?ref_url=%2F"
+VINTED_LOGIN_URLS = (
+    VINTED_HOME,
+    VINTED_SIGNUP_LOGIN_URL,
+)
+VINTED_LOGIN_RETRY_COOLDOWN_SECONDS = 20 * 60
 VINTED_PARCEL_PATHS = (
     "/inbox",
     "/my_purchases",
@@ -226,7 +232,7 @@ def settings_from_options(addon_options: dict[str, Any]) -> Settings:
         ),
         vinted_auto_login=parse_bool(addon_options.get("vinted_auto_login"), False),
         vinted_accounts=vinted_accounts_from_options(addon_options),
-        vinted_login_interval_hours=parse_int(addon_options.get("vinted_login_interval_hours"), 22),
+        vinted_login_interval_hours=parse_int(addon_options.get("vinted_login_interval_hours"), 6),
         vinted_login_on_start=parse_bool(addon_options.get("vinted_login_on_start"), True),
     )
 
@@ -372,33 +378,25 @@ async def vinted_session_update(request: web.Request) -> web.Response:
     if len(cookie) > VINTED_MAX_COOKIE_LENGTH:
         return web.json_response({"success": False, "error": "cookie_too_large"}, status=413)
 
-    names = vinted_cookie_names(cookie)
-    if not (
-        names & VINTED_REQUIRED_COOKIE_NAMES
-        or any(name.startswith("_vinted") and name.endswith("_session") for name in names)
-    ):
+    if not vinted_cookie_has_login_material(cookie):
         return web.json_response({"success": False, "error": "missing_login_cookie"}, status=400)
 
-    store = load_vinted_session_store()
-    store[account_key] = {
-        "cookie": cookie,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    write_vinted_session_store(store)
+    persisted = persist_vinted_session_cookie(account_key, cookie, source="session_cookie_bridge")
     states = dict(request.app.get("vinted_login_states") or {})
     states[account_key] = {
         "status": "ok",
         "reason": "session_cookie_bridge",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "detail": "session_cookie_stored",
+        "session": stored_vinted_session_summary(account_key),
     }
     request.app["vinted_login_states"] = states
     return web.json_response(
         {
             "success": True,
             "account": account_key,
-            "cookie_names": sorted(names),
-            "stored": True,
+            "cookie_names": persisted.get("cookie_names", []),
+            "stored": persisted.get("stored", False),
         }
     )
 
@@ -1522,6 +1520,14 @@ def vinted_cookie_names(cookie: str) -> set[str]:
     return {part.split("=", 1)[0].strip() for part in str(cookie or "").split(";") if "=" in part}
 
 
+def vinted_cookie_has_login_material(cookie: str) -> bool:
+    names = vinted_cookie_names(cookie)
+    return bool(
+        names & VINTED_REQUIRED_COOKIE_NAMES
+        or any(name.startswith("_vinted") and name.endswith("_session") for name in names)
+    )
+
+
 def load_vinted_session_store(path: Path = VINTED_SESSION_STORE_PATH) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
@@ -1542,11 +1548,65 @@ def write_vinted_session_store(store: dict[str, dict[str, str]], path: Path = VI
         pass
 
 
+def persist_vinted_session_cookie(
+    account_key: str,
+    cookie: str,
+    *,
+    source: str,
+    path: Path = VINTED_SESSION_STORE_PATH,
+) -> dict[str, Any]:
+    cookie = clean_vinted_cookie_string(cookie)
+    if not cookie:
+        return {"stored": False, "reason": "empty_cookie"}
+    if len(cookie) > VINTED_MAX_COOKIE_LENGTH:
+        return {"stored": False, "reason": "cookie_too_large"}
+    if not vinted_cookie_has_login_material(cookie):
+        return {"stored": False, "reason": "missing_login_cookie"}
+
+    names = sorted(vinted_cookie_names(cookie))
+    store = load_vinted_session_store(path)
+    store[account_key] = {
+        "cookie": cookie,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "cookie_names": names,
+    }
+    write_vinted_session_store(store, path)
+    return {
+        "stored": True,
+        "updated_at": store[account_key]["updated_at"],
+        "source": source,
+        "cookie_names": names,
+        "has_api_tokens": bool(vinted_cookie_names(cookie) & VINTED_REQUIRED_COOKIE_NAMES),
+    }
+
+
 def stored_vinted_session_cookie(account_key: str) -> str:
-    entry = load_vinted_session_store().get(account_key)
+    entry = load_vinted_session_store(VINTED_SESSION_STORE_PATH).get(account_key)
     if not isinstance(entry, dict):
         return ""
     return clean_vinted_cookie_string(str(entry.get("cookie") or ""))
+
+
+def stored_vinted_session_summary(account_key: str) -> dict[str, Any]:
+    entry = load_vinted_session_store(VINTED_SESSION_STORE_PATH).get(account_key)
+    if not isinstance(entry, dict):
+        return {"stored": False}
+    cookie = clean_vinted_cookie_string(str(entry.get("cookie") or ""))
+    names = sorted(vinted_cookie_names(cookie))
+    return {
+        "stored": bool(cookie),
+        "updated_at": entry.get("updated_at"),
+        "source": entry.get("source"),
+        "cookie_names": names,
+        "has_api_tokens": bool(vinted_cookie_names(cookie) & VINTED_REQUIRED_COOKIE_NAMES),
+    }
+
+
+def vinted_cookie_from_values(cookie_values: dict[str, str]) -> str:
+    return clean_vinted_cookie_string(
+        "; ".join(f"{name}={value}" for name, value in cookie_values.items() if value)
+    )
 
 
 async def run_vinted_browser_fallback(
@@ -1560,7 +1620,11 @@ async def run_vinted_browser_fallback(
     settings: Settings = app["settings"]
     state = vinted_account_state(app, account)
     state_status = str(state.get("status") or "")
-    if state_status != "ok" and not debug:
+    if should_skip_vinted_browser_fallback(
+        state_status,
+        debug=debug,
+        auto_login=settings.vinted_auto_login,
+    ):
         diagnostics = {
             "browser_skipped": True,
             "login_state": state_status or "pending",
@@ -1568,6 +1632,19 @@ async def run_vinted_browser_fallback(
         }
         return {
             "status": api_result.get("status") or state_status or "login_required",
+            "records": [],
+            "diagnostics": diagnostics,
+        }
+    cooldown_remaining = vinted_login_retry_cooldown_remaining(state)
+    if state_status != "ok" and not debug and cooldown_remaining > 0:
+        diagnostics = {
+            "browser_skipped": True,
+            "login_state": state_status or "pending",
+            "login_retry_cooldown_seconds": cooldown_remaining,
+            "api_client": api_result.get("diagnostics") if isinstance(api_result.get("diagnostics"), dict) else {},
+        }
+        return {
+            "status": state_status or api_result.get("status") or "login_required",
             "records": [],
             "diagnostics": diagnostics,
         }
@@ -1595,7 +1672,36 @@ async def run_vinted_browser_fallback(
                 },
             }
         if settings.vinted_auto_login and state_status != "ok":
-            await run_vinted_login(app, reason="parcel_scrape_preflight", account=account)
+            login_timeout = min(timeout, vinted_login_attempt_timeout(settings))
+            try:
+                login_result = await asyncio.wait_for(
+                    run_vinted_login(app, reason="parcel_scrape_preflight", account=account),
+                    timeout=login_timeout,
+                )
+            except TimeoutError:
+                return {
+                    "status": "login_timeout",
+                    "records": [],
+                    "diagnostics": {
+                        "login_state": "login_timeout",
+                        "login_timeout_seconds": login_timeout,
+                        "api_client": api_result.get("diagnostics")
+                        if isinstance(api_result.get("diagnostics"), dict)
+                        else {},
+                    },
+                }
+            state_status = str(login_result.get("status") or "")
+            if state_status != "ok":
+                return {
+                    "status": state_status or api_result.get("status") or "login_required",
+                    "records": [],
+                    "diagnostics": {
+                        "login_state": state_status or "login_required",
+                        "api_client": api_result.get("diagnostics")
+                        if isinstance(api_result.get("diagnostics"), dict)
+                        else {},
+                    },
+                }
         try:
             result = await asyncio.wait_for(
                 run_vinted_parcel_scrape(app, account=account, debug=debug, use_api=False, api_result=api_result),
@@ -1629,6 +1735,49 @@ async def run_vinted_browser_fallback(
         return result
     finally:
         lock.release()
+
+
+def should_skip_vinted_browser_fallback(
+    state_status: str,
+    *,
+    debug: bool,
+    auto_login: bool,
+) -> bool:
+    if debug:
+        return False
+    if not state_status or state_status == "ok":
+        return False
+    if vinted_login_needs_manual_attention(state_status):
+        return True
+    return not auto_login
+
+
+def vinted_login_attempt_timeout(settings: Settings) -> int:
+    return max(20, min(int(settings.timeout) + 15, 75))
+
+
+def vinted_login_retry_cooldown_remaining(
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> int:
+    status = str(state.get("status") or "")
+    if not status or status == "ok" or vinted_login_needs_manual_attention(status):
+        return 0
+    updated_at = str(state.get("updated_at") or "")
+    if not updated_at:
+        return 0
+    try:
+        updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    elapsed = max(0, int((reference - updated).total_seconds()))
+    return max(0, VINTED_LOGIN_RETRY_COOLDOWN_SECONDS - elapsed)
 
 
 def fetch_vinted_api_records_sync(account: VintedAccount) -> dict[str, Any]:
@@ -1743,6 +1892,12 @@ def fetch_vinted_api_records_sync(account: VintedAccount) -> dict[str, Any]:
             cookie_values["refresh_token_web"] = new_refresh_token
             session.cookies.set("refresh_token_web", new_refresh_token, domain="www.vinted.nl", path="/")
         diagnostics["method"] = "session_cookie_refresh"
+        persisted = persist_vinted_session_cookie(
+            account.key,
+            vinted_cookie_from_values(cookie_values),
+            source="api_refresh",
+        )
+        diagnostics["stored_session_refreshed"] = bool(persisted.get("stored"))
         return True
 
     def login_with_password() -> None:
@@ -1770,7 +1925,20 @@ def fetch_vinted_api_records_sync(account: VintedAccount) -> dict[str, Any]:
         login_data = response_json(login)
         token = str(login_data.get("access_token") or "").strip()
         if token:
+            cookie_values["access_token_web"] = token
             session.headers["Authorization"] = f"Bearer {token}"
+            session.cookies.set("access_token_web", token, domain="www.vinted.nl", path="/")
+        refresh_token = str(login_data.get("refresh_token") or "").strip()
+        if refresh_token:
+            cookie_values["refresh_token_web"] = refresh_token
+            session.cookies.set("refresh_token_web", refresh_token, domain="www.vinted.nl", path="/")
+        if cookie_values:
+            persisted = persist_vinted_session_cookie(
+                account.key,
+                vinted_cookie_from_values(cookie_values),
+                source="password_oauth",
+            )
+            diagnostics["stored_session_refreshed"] = bool(persisted.get("stored"))
 
     try:
         home = request("get", VINTED_HOME, timeout=request_timeout)
@@ -1985,6 +2153,20 @@ async def fetch_vinted_api_payloads(context, settings: Settings) -> list[tuple[s
     return payloads
 
 
+async def persist_vinted_context_session(
+    account: VintedAccount,
+    context,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    try:
+        cookies = await context.cookies([VINTED_HOME])
+    except PlaywrightError:
+        return {"stored": False, "reason": "playwright_cookie_error"}
+    cookie = vinted_cookie_from_list(cookies)
+    return persist_vinted_session_cookie(account.key, cookie, source=source)
+
+
 async def extract_vinted_detail_links(page) -> list[str]:
     try:
         links = await page.locator("a[href]").evaluate_all(
@@ -2024,6 +2206,7 @@ def vinted_status_payload(app: web.Application) -> dict[str, Any]:
             "configured": True,
             "profile_exists": account.profile_dir.exists(),
             "state": account_states.get(account.key, {"status": "pending", "updated_at": None}),
+            "stored_session": stored_vinted_session_summary(account.key),
         }
         for account in settings.vinted_accounts
     ]
@@ -2071,7 +2254,20 @@ async def refresh_vinted_login(
     async with lock:
         results = {}
         for account in accounts:
-            results[account.key] = await run_vinted_login(app, reason=reason, account=account)
+            timeout = vinted_login_attempt_timeout(settings)
+            try:
+                results[account.key] = await asyncio.wait_for(
+                    run_vinted_login(app, reason=reason, account=account),
+                    timeout=timeout,
+                )
+            except TimeoutError:
+                results[account.key] = set_vinted_login_state(
+                    app,
+                    account=account,
+                    status="login_timeout",
+                    reason=reason,
+                    detail=f"timed out after {timeout}s",
+                )
         return set_vinted_login_summary(
             app,
             status=aggregate_vinted_status(results),
@@ -2087,13 +2283,14 @@ async def run_vinted_login(
     account: VintedAccount,
 ) -> dict[str, Any]:
     settings: Settings = app["settings"]
-    if account.session_cookie or stored_vinted_session_cookie(account.key):
+    if (account.session_cookie or stored_vinted_session_cookie(account.key)) and not (account.email and account.password):
         return set_vinted_login_state(
             app,
             account=account,
             status="ok",
             reason=reason,
             detail="session_cookie_configured",
+            session=stored_vinted_session_summary(account.key),
         )
     playwright = app["playwright"]
     account.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2108,18 +2305,24 @@ async def run_vinted_login(
         await page.goto(VINTED_HOME, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
         await dismiss_vinted_overlays(page)
         if await vinted_page_looks_logged_in(page):
+            session = await persist_vinted_context_session(account, context, source="browser_profile")
             return set_vinted_login_state(
                 app,
                 account=account,
                 status="ok",
                 reason=reason,
-                detail="already_logged_in",
+                detail="already_logged_in;session_stored" if session.get("stored") else "already_logged_in",
+                session=session if session.get("stored") else stored_vinted_session_summary(account.key),
             )
 
-        await page.goto(VINTED_LOGIN_URL, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
-        await dismiss_vinted_overlays(page)
-        await reveal_vinted_email_login_form(page)
-        filled = await fill_vinted_credentials(page, account)
+        filled = False
+        for login_url in VINTED_LOGIN_URLS:
+            await page.goto(login_url, wait_until="domcontentloaded", timeout=settings.timeout * 1000)
+            await dismiss_vinted_overlays(page)
+            await reveal_vinted_email_login_form(page)
+            filled = await fill_vinted_credentials(page, account)
+            if filled:
+                break
         if not filled:
             text = await safe_body_text(page)
             blocker = vinted_login_blocker(text)
@@ -2142,14 +2345,22 @@ async def run_vinted_login(
         if blocker:
             return set_vinted_login_state(app, account=account, status=blocker, reason=reason)
         if await vinted_page_looks_logged_in(page):
+            session = await persist_vinted_context_session(account, context, source="browser_login")
             return set_vinted_login_state(
                 app,
                 account=account,
                 status="ok",
                 reason=reason,
-                detail="submitted_credentials",
+                detail="submitted_credentials;session_stored" if session.get("stored") else "submitted_credentials",
+                session=session if session.get("stored") else stored_vinted_session_summary(account.key),
             )
-        return set_vinted_login_state(app, account=account, status="login_required", reason=reason)
+        return set_vinted_login_state(
+            app,
+            account=account,
+            status="login_required",
+            reason=reason,
+            detail=redact_vinted_debug_text(text)[:300],
+        )
     except PlaywrightError as err:
         LOG.warning("Vinted login refresh failed: %s", err)
         return set_vinted_login_state(
@@ -2180,7 +2391,23 @@ async def dismiss_vinted_overlays(page) -> None:
 
 
 async def reveal_vinted_email_login_form(page) -> None:
+    if page.url.rstrip("/") == VINTED_HOME.rstrip("/"):
+        await click_vinted_selector(page, '[data-testid="header--login-button"]')
+        await page.wait_for_timeout(900)
+
+    for _ in range(3):
+        if await click_vinted_selector(page, '[data-testid="auth-select-type--login-email"]'):
+            await page.wait_for_timeout(900)
+            return
+        if await click_vinted_selector(page, '[data-testid="auth-select-type--register-switch"]'):
+            await page.wait_for_timeout(900)
+            continue
+        break
+
     for label in (
+        "Registreren | Inloggen",
+        "Register | Log in",
+        "Sign up | Log in",
         "Inloggen",
         "Log in",
         "Aanmelden",
@@ -2191,9 +2418,24 @@ async def reveal_vinted_email_login_form(page) -> None:
             await page.wait_for_timeout(600)
             break
 
+    for _ in range(3):
+        if await click_vinted_selector(page, '[data-testid="auth-select-type--login-email"]'):
+            await page.wait_for_timeout(900)
+            return
+        if await click_vinted_selector(page, '[data-testid="auth-select-type--register-switch"]'):
+            await page.wait_for_timeout(900)
+            continue
+        break
+
+    if await page.locator('[data-testid="auth-select-type--register-email"]').count() > 0:
+        return
+
     for label in (
         "E-mail",
         "Email",
+        "e-mail",
+        "login met e-mail",
+        "login mete-mail",
         "Log in with email",
         "Inloggen met e-mail",
         "Ga verder met e-mail",
@@ -2205,6 +2447,17 @@ async def reveal_vinted_email_login_form(page) -> None:
             return
 
 
+async def click_vinted_selector(page, selector: str) -> bool:
+    try:
+        locator = page.locator(selector).first
+        if await locator.count() < 1:
+            return False
+        await locator.dispatch_event("click", timeout=1500)
+        return True
+    except PlaywrightError:
+        return False
+
+
 async def click_vinted_control(page, label: str) -> bool:
     pattern = re.compile(re.escape(label), re.IGNORECASE)
     for role in ("button", "link"):
@@ -2214,6 +2467,11 @@ async def click_vinted_control(page, label: str) -> bool:
         except PlaywrightError:
             continue
     try:
+        await page.locator("[role='button']").filter(has_text=pattern).first.dispatch_event("click", timeout=1200)
+        return True
+    except PlaywrightError:
+        pass
+    try:
         await page.get_by_text(pattern).click(timeout=1200)
         return True
     except PlaywrightError:
@@ -2221,6 +2479,8 @@ async def click_vinted_control(page, label: str) -> bool:
 
 
 async def fill_vinted_credentials(page, account: VintedAccount) -> bool:
+    if await vinted_page_looks_register_form(page):
+        return False
     email_filled = await fill_first_locator(
         page,
         (
@@ -2229,6 +2489,10 @@ async def fill_vinted_credentials(page, account: VintedAccount) -> bool:
             'input[name="login"]',
             'input[name="username"]',
             'input[autocomplete="username"]',
+            'input[id*="email"]',
+            'input[id*="login"]',
+            'input[data-testid*="email"]',
+            'input[data-testid*="login"]',
         ),
         account.email,
     )
@@ -2238,13 +2502,15 @@ async def fill_vinted_credentials(page, account: VintedAccount) -> bool:
             'input[type="password"]',
             'input[name="password"]',
             'input[autocomplete="current-password"]',
+            'input[id*="password"]',
+            'input[data-testid*="password"]',
         ),
         account.password,
     )
     if not (email_filled and password_filled):
         return False
 
-    for label in ("Inloggen", "Log in", "Aanmelden", "Sign in", "Continue", "Doorgaan"):
+    for label in ("Verder", "Inloggen", "Log in", "Aanmelden", "Sign in", "Continue", "Doorgaan"):
         try:
             await page.get_by_role("button", name=re.compile(label, re.IGNORECASE)).click(timeout=1500)
             return True
@@ -2266,6 +2532,23 @@ async def fill_first_locator(page, selectors: tuple[str, ...], value: str) -> bo
         except PlaywrightError:
             continue
     return False
+
+
+async def vinted_page_looks_register_form(page) -> bool:
+    return vinted_text_looks_register_form(await safe_body_text(page))
+
+
+def vinted_text_looks_register_form(value: str) -> bool:
+    folded = fold_text(value)
+    return any(
+        term in folded
+        for term in (
+            "registreren met e-mailadres",
+            "registreren met e-mail",
+            "sign up with email",
+            "register with email",
+        )
+    )
 
 
 async def vinted_page_looks_logged_in(page) -> bool:
@@ -2318,6 +2601,7 @@ def set_vinted_login_state(
     status: str,
     reason: str,
     detail: str | None = None,
+    session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {
         "status": status,
@@ -2326,6 +2610,8 @@ def set_vinted_login_state(
     }
     if detail:
         state["detail"] = detail
+    if session:
+        state["session"] = session
     states = dict(app.get("vinted_login_states") or {})
     states[account.key] = state
     app["vinted_login_states"] = states

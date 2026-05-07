@@ -21,7 +21,7 @@ Supported carriers:
 | `timeout` | `45` | Browser request timeout in seconds. |
 | `vinted_auto_login` | `false` | Periodically refreshes a Vinted browser session when credentials are configured. |
 | `vinted_login_on_start` | `true` | Runs one Vinted login refresh when the add-on starts. |
-| `vinted_login_interval_hours` | `22` | Delay between automatic Vinted login refreshes. |
+| `vinted_login_interval_hours` | `6` | Delay between automatic Vinted login/session refreshes. |
 | `vinted_email` | not set | First Vinted account e-mail; keep this local in the add-on options. |
 | `vinted_password` | not set | First Vinted password; stored by Home Assistant as a password option. |
 | `vinted_session_cookie` | not set | Optional first-account Vinted browser session cookie. Prefer this when Vinted blocks password auth. |
@@ -40,6 +40,13 @@ and login state do not overwrite each other. It does not try to bypass captcha,
 two-factor prompts, suspicious-login checks, or account challenges; it returns a
 clear status such as `captcha_required`, `two_factor_required`, or
 `login_required`.
+
+After a successful browser login or an already logged-in browser profile, the
+add-on stores a sanitized Vinted session cookie locally under
+`/data/vinted_sessions.json` and uses it for the lighter API-first parcel mirror.
+When Vinted refreshes an access token, the refreshed session is written back to
+that same local store. Status and health endpoints expose only safe metadata
+such as cookie names and timestamps, never cookie values or account tokens.
 
 The parcel mirror uses a lighter API-first flow before it opens Chromium. If
 Vinted rejects password auth, you can provide a local `vinted_session_cookie`

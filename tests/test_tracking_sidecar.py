@@ -1,16 +1,27 @@
+from datetime import datetime, timezone
+
 from addons.parcels_fedex_scraper.app.main import (
+    VINTED_LOGIN_URLS,
+    VINTED_LOGIN_RETRY_COOLDOWN_SECONDS,
     clean_vinted_cookie_string,
     dedupe_vinted_records,
+    persist_vinted_session_cookie,
     normalize_chronopost_text,
     settings_from_options,
+    stored_vinted_session_summary,
+    should_skip_vinted_browser_fallback,
     vinted_record_from_text,
     vinted_record_from_api_package,
     vinted_records_from_json,
     vinted_configured,
+    vinted_cookie_has_login_material,
     vinted_login_blocker,
     vinted_login_needs_manual_attention,
+    vinted_login_attempt_timeout,
+    vinted_login_retry_cooldown_remaining,
     vinted_package_from_conversation,
     vinted_page_looks_logged_out,
+    vinted_text_looks_register_form,
     vinted_carrier_tracking_from_values,
 )
 
@@ -20,7 +31,7 @@ def test_sidecar_settings_include_disabled_vinted_auto_login_by_default():
 
     assert settings.vinted_auto_login is False
     assert settings.vinted_login_on_start is True
-    assert settings.vinted_login_interval_hours == 22
+    assert settings.vinted_login_interval_hours == 6
     assert settings.vinted_accounts == ()
     assert vinted_configured(settings) is False
 
@@ -44,6 +55,27 @@ def test_sidecar_settings_enable_vinted_auto_login_from_options():
     assert settings.vinted_accounts[0].session_cookie == ""
     assert str(settings.vinted_accounts[0].profile_dir).endswith("/vinted")
     assert vinted_configured(settings) is True
+
+
+def test_vinted_login_attempt_timeout_is_bounded_for_small_haos_hosts():
+    assert vinted_login_attempt_timeout(settings_from_options({"timeout": 10})) == 25
+    assert vinted_login_attempt_timeout(settings_from_options({"timeout": 45})) == 60
+    assert vinted_login_attempt_timeout(settings_from_options({"timeout": 90})) == 75
+
+
+def test_vinted_login_retry_cooldown_avoids_immediate_browser_hammering():
+    now = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
+    state = {"status": "login_required", "updated_at": now.isoformat()}
+
+    assert vinted_login_retry_cooldown_remaining(state, now=now) == VINTED_LOGIN_RETRY_COOLDOWN_SECONDS
+    assert (
+        vinted_login_retry_cooldown_remaining(
+            state,
+            now=datetime(2026, 5, 7, 8, 30, tzinfo=timezone.utc),
+        )
+        == 0
+    )
+    assert vinted_login_retry_cooldown_remaining({"status": "captcha_required", "updated_at": now.isoformat()}, now=now) == 0
 
 
 def test_sidecar_settings_support_two_vinted_accounts():
@@ -91,6 +123,47 @@ def test_vinted_cookie_sanitizer_keeps_only_allowed_login_cookies():
     assert "sessionid=drop" not in cookie
 
 
+def test_vinted_cookie_login_material_accepts_tokens_or_vinted_session():
+    assert vinted_cookie_has_login_material("access_token_web=abc; refresh_token_web=def") is True
+    assert vinted_cookie_has_login_material("_vinted_fr_session=ghi") is True
+    assert vinted_cookie_has_login_material("datadome=jkl") is False
+
+
+def test_vinted_session_store_persists_only_safe_metadata(tmp_path):
+    path = tmp_path / "vinted_sessions.json"
+    result = persist_vinted_session_cookie(
+        "account_1",
+        "access_token_web=abc; refresh_token_web=def; sessionid=drop",
+        source="test",
+        path=path,
+    )
+
+    assert result["stored"] is True
+    assert result["has_api_tokens"] is True
+    assert result["cookie_names"] == ["access_token_web", "refresh_token_web"]
+    payload = path.read_text(encoding="utf-8")
+    assert "sessionid" not in payload
+    assert "source" in payload
+
+
+def test_vinted_session_summary_does_not_return_cookie_values(tmp_path, monkeypatch):
+    path = tmp_path / "vinted_sessions.json"
+    persist_vinted_session_cookie(
+        "account_1",
+        "access_token_web=abc; refresh_token_web=def",
+        source="test",
+        path=path,
+    )
+    monkeypatch.setattr("addons.parcels_fedex_scraper.app.main.VINTED_SESSION_STORE_PATH", path)
+
+    summary = stored_vinted_session_summary("account_1")
+
+    assert summary["stored"] is True
+    assert summary["cookie_names"] == ["access_token_web", "refresh_token_web"]
+    assert "abc" not in str(summary)
+    assert "def" not in str(summary)
+
+
 def test_vinted_login_blocker_detects_manual_challenges():
     assert vinted_login_blocker("Please solve the captcha to continue") == "captcha_required"
     assert vinted_login_blocker("Enter your verification code") == "two_factor_required"
@@ -104,11 +177,30 @@ def test_vinted_browser_login_form_failures_do_not_block_api_scrape():
     assert vinted_login_needs_manual_attention("login_required") is False
 
 
+def test_vinted_browser_fallback_retries_login_required_when_auto_login_enabled():
+    assert should_skip_vinted_browser_fallback("login_required", debug=False, auto_login=True) is False
+    assert should_skip_vinted_browser_fallback("login_required", debug=False, auto_login=False) is True
+    assert should_skip_vinted_browser_fallback("captcha_required", debug=False, auto_login=True) is True
+    assert should_skip_vinted_browser_fallback("captcha_required", debug=True, auto_login=True) is False
+
+
 def test_vinted_logged_out_landing_page_is_not_a_valid_session():
     assert vinted_page_looks_logged_out(
         "artikelen registreren | inloggen verkoop nu word lid en verkoop tweedehands kleding "
         "ga verder met google heb je al een account? inloggen"
     )
+
+
+def test_vinted_register_form_is_not_used_as_login_form():
+    assert vinted_text_looks_register_form(
+        "Registreren met e-mailadres Gebruikersnaam mag niet leeg zijn Kies een ander, uniek"
+    )
+    assert not vinted_text_looks_register_form("Inloggen Verder Wachtwoord vergeten?")
+
+
+def test_vinted_login_entry_points_use_current_public_auth_page():
+    assert "https://www.vinted.nl/member/signup/select_type?ref_url=%2F" in VINTED_LOGIN_URLS
+    assert all("/member/login" not in url for url in VINTED_LOGIN_URLS)
 
 
 def test_vinted_text_extracts_pickup_and_chronopost_reference():
