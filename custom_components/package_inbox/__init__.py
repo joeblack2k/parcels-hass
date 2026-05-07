@@ -78,6 +78,11 @@ from .const import (
     STORAGE_VERSION,
 )
 from .dashboard import build_dashboard_snapshot
+from .deleted_imports import (
+    deleted_import_tombstone_for_record,
+    prune_deleted_imports,
+    record_matches_deleted_import,
+)
 from .notifications import (
     format_pickup_notification,
     format_pickup_summary,
@@ -232,11 +237,13 @@ class PackageInboxManager:
         self.data = loaded if isinstance(loaded, dict) else {}
         self.data.setdefault("packages", {})
         self.data.setdefault("processed_messages", {})
+        self.data.setdefault("deleted_imports", {})
         self.data.setdefault("notifications", {})
         self.data["notifications"].setdefault("morning_summary", {})
         self.data["notifications"].setdefault("pickup_summary", {})
         self.data["notifications"].setdefault("pickup_notified", [])
         self.data["notifications"].setdefault("extra_today_notified", [])
+        prune_deleted_imports(self.data["deleted_imports"])
 
     async def async_setup(self) -> None:
         """Register services and optional event listener."""
@@ -717,6 +724,11 @@ class PackageInboxManager:
             return {"deleted": False, "reason": "unknown_package_key", "package_key": package_key}
 
         deleted = packages.pop(package_key)
+        tombstone = deleted_import_tombstone_for_record(package_key, _normalize_record(deleted))
+        if tombstone:
+            deleted_imports = self.data.setdefault("deleted_imports", {})
+            deleted_imports.setdefault("vinted", []).append(tombstone)
+            prune_deleted_imports(deleted_imports)
         _remove_package_key_from_notifications(self.data.get("notifications"), package_key)
         self.data["last_updated"] = dt_util.now().isoformat()
         await self._async_save()
@@ -771,6 +783,8 @@ class PackageInboxManager:
             normalized = apply_vinted_cross_reference(normalized, packages)
             key = normalized.get("key") or stable_key(normalized)
             normalized["key"] = key
+            if record_matches_deleted_import(normalized, self.data.get("deleted_imports")):
+                continue
             normalized["updated_at"] = now
 
             previous = packages.get(key, {})
