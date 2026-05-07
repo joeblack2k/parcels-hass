@@ -81,8 +81,11 @@ from .dashboard import build_dashboard_snapshot
 from .notifications import (
     format_pickup_notification,
     format_pickup_summary,
+    format_vinted_tracking_notification,
     is_vinted_record,
     notification_package_title,
+    should_notify_vinted_tracking,
+    vinted_tracking_fingerprint,
 )
 from .parser import clean_text, is_likely_package_email, parse_email, stable_key
 from .record_merge import apply_vinted_cross_reference, merge_tracking_update, reconcile_vinted_carrier_links
@@ -445,7 +448,7 @@ class PackageInboxManager:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if package_key and not any(_record_has_vinted_source(record) for _, record in candidates):
             return ([], [])
-        result = await self._async_fetch_vinted_sidecar_records()
+        result = await self._async_fetch_vinted_sidecar_records(candidates=candidates)
         if not result:
             return ([], [])
         records = result.get("records") if isinstance(result.get("records"), list) else []
@@ -1150,7 +1153,11 @@ class PackageInboxManager:
             _LOGGER.debug("Tracking scraper failed for %s: %s", record.get("key"), err)
             return None
 
-    async def _async_fetch_vinted_sidecar_records(self) -> dict[str, Any] | None:
+    async def _async_fetch_vinted_sidecar_records(
+        self,
+        *,
+        candidates: list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> dict[str, Any] | None:
         """Mirror normalized Vinted parcels from the optional local browser sidecar."""
         base_url = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_URL))
         if not base_url:
@@ -1166,9 +1173,15 @@ class PackageInboxManager:
         token = _clean_optional(self.config.get(CONF_TRACKING_SCRAPER_TOKEN))
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        known_context = _vinted_sidecar_known_context(candidates or [])
 
         try:
-            async with session.get(endpoint, headers=headers, timeout=timeout) as response:
+            request = (
+                session.post(endpoint, json=known_context, headers=headers, timeout=timeout)
+                if known_context
+                else session.get(endpoint, headers=headers, timeout=timeout)
+            )
+            async with request as response:
                 text = await response.text(errors="replace")
                 if response.status >= 400:
                     return {
@@ -1296,6 +1309,14 @@ class PackageInboxManager:
                 notified.append(key)
             return
 
+        if should_notify_vinted_tracking(record):
+            notified = record.setdefault("notified", {})
+            fingerprint = vinted_tracking_fingerprint(record)
+            if notified.get("vinted_tracking") != fingerprint:
+                await self._async_notify_vinted_tracking(record)
+                notified["vinted_tracking"] = fingerprint
+            return
+
         if self._record_due_today(record) and _after_morning_cutoff():
             notified = self.data["notifications"]["extra_today_notified"]
             summary_keys = self.data["notifications"]["morning_summary"].get(
@@ -1317,6 +1338,9 @@ class PackageInboxManager:
                 message=f"{carrier} afhaal QR-code",
                 mime_type=mimetypes.guess_type(qr_file_path)[0] or "image/png",
             )
+
+    async def _async_notify_vinted_tracking(self, record: dict[str, Any]) -> None:
+        await self._async_send_text(format_vinted_tracking_notification(record))
 
     async def _async_notify_extra_today(self, record: dict[str, Any]) -> None:
         carrier = _carrier_title(record.get("carrier"))
@@ -2009,6 +2033,38 @@ def _stale_vinted_pickups_to_retire(
         }
         retired.append(record)
     return retired
+
+
+def _vinted_sidecar_known_context(candidates: list[tuple[str, dict[str, Any]]]) -> dict[str, list[str]]:
+    conversation_ids: list[str] = []
+    source_urls: list[str] = []
+    for _, record in candidates:
+        normalized = _normalize_record(record)
+        if not _record_has_vinted_source(normalized):
+            continue
+        extra = normalized.get("extra") if isinstance(normalized.get("extra"), dict) else {}
+        for value in (
+            extra.get("vinted_thread_id"),
+            extra.get("vinted_cross_reference", {}).get("vinted_thread_id")
+            if isinstance(extra.get("vinted_cross_reference"), dict)
+            else None,
+        ):
+            text = clean_text(str(value or ""))
+            if text and text not in conversation_ids:
+                conversation_ids.append(text)
+        for value in (
+            extra.get("vinted_source_url"),
+            normalized.get("tracking_url") if _carrier_slug(normalized.get("carrier")) == "vinted" else None,
+        ):
+            text = clean_text(str(value or ""))
+            if text.startswith("https://www.vinted.nl/inbox/") and text not in source_urls:
+                source_urls.append(text)
+    context: dict[str, list[str]] = {}
+    if conversation_ids:
+        context["known_conversation_ids"] = conversation_ids[:40]
+    if source_urls:
+        context["source_urls"] = source_urls[:40]
+    return context
 
 
 def _vinted_current_record_ids(records: list[dict[str, Any]]) -> set[str]:

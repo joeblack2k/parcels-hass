@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+import hashlib
 import re
 from typing import Any
 
@@ -95,6 +97,88 @@ def format_vinted_pickup_notification(record: dict[str, Any]) -> str:
     )
 
 
+def format_vinted_tracking_notification(record: dict[str, Any]) -> str:
+    """Format an in-room Vinted tracking update with the app-visible details."""
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    article = first_clean(extra.get("vinted_item_title"), record.get("item_title"), record.get("title")) or UNKNOWN
+    other_party = first_clean(extra.get("vinted_other_party"), extra.get("seller"), extra.get("buyer"))
+    carrier = vinted_tracking_carrier(record)
+    tracking_code = vinted_tracking_code(record)
+    expected = vinted_expected_text(record)
+    link = vinted_tracking_link(record)
+    status = vinted_status_label(record.get("status"))
+    events = vinted_tracking_events(record)[:4]
+
+    lines = [f"Vinted pakket {status}", f"Artikel: {article}"]
+    if other_party:
+        lines.append(f"Vinted: {other_party}")
+    if carrier:
+        lines.append(f"Vervoerder: {carrier}")
+    if tracking_code:
+        lines.append(f"Trackingcode: {tracking_code}")
+    if expected:
+        lines.append(f"Verwacht: {expected}")
+    if link:
+        lines.append(f"Tracking: {link}")
+    if events:
+        lines.append("")
+        lines.append("Trackinginformatie:")
+        for event in events:
+            label = first_clean(event.get("status"), event.get("label"), event.get("message"))
+            timestamp = format_event_timestamp(event.get("timestamp") or event.get("created_at") or event.get("date"))
+            if label and timestamp:
+                lines.append(f"- {label}: {timestamp}")
+            elif label:
+                lines.append(f"- {label}")
+    return "\n".join(lines)
+
+
+def vinted_tracking_fingerprint(record: dict[str, Any]) -> str:
+    """Return a compact fingerprint for deduping Vinted tracking room updates."""
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    cross = extra.get("vinted_cross_reference") if isinstance(extra.get("vinted_cross_reference"), dict) else {}
+    events = vinted_tracking_events(record)[:4]
+    parts = [
+        str(record.get("status") or ""),
+        str(record.get("tracking_code") or ""),
+        str(record.get("expected_date") or cross.get("expected_date") or ""),
+        str(
+            extra.get("expected_date_end")
+            or extra.get("vinted_expected_date_to")
+            or cross.get("expected_date_end")
+            or cross.get("vinted_expected_date_to")
+            or ""
+        ),
+        str(vinted_tracking_code(record) or ""),
+        str(vinted_tracking_link(record) or ""),
+        "|".join(
+            f"{event.get('status') or event.get('label') or event.get('message')}/{event.get('timestamp') or event.get('created_at') or event.get('date')}"
+            for event in events
+            if isinstance(event, dict)
+        ),
+    ]
+    raw = "\n".join(parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def should_notify_vinted_tracking(record: dict[str, Any]) -> bool:
+    if not is_vinted_record(record):
+        return False
+    status = str(record.get("status") or "")
+    if status in {"", "unknown", "ready_for_pickup", "picked_up", "cancelled", "canceled"}:
+        return False
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    return bool(
+        first_clean(extra.get("vinted_item_title"), record.get("item_title"), record.get("title"))
+        and (
+            vinted_tracking_code(record)
+            or vinted_tracking_link(record)
+            or record.get("expected_date")
+            or extra.get("tracking_events")
+        )
+    )
+
+
 def vinted_pickup_details(record: dict[str, Any]) -> dict[str, str]:
     """Return display-safe Vinted pickup fields."""
     extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
@@ -167,7 +251,112 @@ def is_vinted_record(record: dict[str, Any]) -> bool:
         or clean_text(str(record.get("shop") or "")).lower() == "vinted"
         or clean_text(str(record.get("source") or "")).lower().startswith("vinted")
         or bool(extra.get("vinted_cross_reference"))
+        or bool(extra.get("vinted_item_title"))
     )
+
+
+def vinted_tracking_carrier(record: dict[str, Any]) -> str:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    reference = extra.get("carrier_tracking") if isinstance(extra.get("carrier_tracking"), dict) else {}
+    carrier = reference.get("carrier") or record.get("carrier")
+    if carrier_slug(carrier) == "vinted":
+        return ""
+    return carrier_title(carrier)
+
+
+def vinted_tracking_code(record: dict[str, Any]) -> str:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    reference = extra.get("carrier_tracking") if isinstance(extra.get("carrier_tracking"), dict) else {}
+    cross = extra.get("vinted_cross_reference") if isinstance(extra.get("vinted_cross_reference"), dict) else {}
+    return first_clean(
+        reference.get("tracking_code"),
+        record.get("tracking_code") if carrier_slug(record.get("carrier")) != "vinted" else None,
+        extra.get("vinted_tracking_code"),
+        cross.get("tracking_code"),
+        record.get("tracking_code"),
+    )
+
+
+def vinted_tracking_link(record: dict[str, Any]) -> str:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    reference = extra.get("carrier_tracking") if isinstance(extra.get("carrier_tracking"), dict) else {}
+    return first_clean(
+        reference.get("tracking_url"),
+        extra.get("vinted_tracking_page_url"),
+        record.get("tracking_url"),
+    )
+
+
+def vinted_expected_text(record: dict[str, Any]) -> str:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    cross = extra.get("vinted_cross_reference") if isinstance(extra.get("vinted_cross_reference"), dict) else {}
+    start = first_clean(record.get("expected_date"), cross.get("expected_date"))
+    end = first_clean(
+        extra.get("expected_date_end"),
+        extra.get("vinted_expected_date_to"),
+        cross.get("expected_date_end"),
+        cross.get("vinted_expected_date_to"),
+    )
+    if start and end and start != end:
+        return f"{format_date(start)} - {format_date(end)}"
+    if start:
+        return format_date(start)
+    return ""
+
+
+def vinted_tracking_events(record: dict[str, Any]) -> list[dict[str, Any]]:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    events = extra.get("tracking_events")
+    if isinstance(events, list):
+        return [event for event in events if isinstance(event, dict)]
+    cross = extra.get("vinted_cross_reference") if isinstance(extra.get("vinted_cross_reference"), dict) else {}
+    cross_events = cross.get("tracking_events")
+    return [event for event in cross_events if isinstance(event, dict)] if isinstance(cross_events, list) else []
+
+
+def vinted_status_label(value: Any) -> str:
+    status = str(value or "").replace("_", " ")
+    return {
+        "in transit": "is onderweg",
+        "expected today": "komt vandaag",
+        "delivered": "is afgeleverd",
+    }.get(status, status or "is bijgewerkt")
+
+
+MONTHS = {
+    1: "januari",
+    2: "februari",
+    3: "maart",
+    4: "april",
+    5: "mei",
+    6: "juni",
+    7: "juli",
+    8: "augustus",
+    9: "september",
+    10: "oktober",
+    11: "november",
+    12: "december",
+}
+
+
+def format_date(value: Any) -> str:
+    text = first_clean(value)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return f"{parsed.day} {MONTHS.get(parsed.month, parsed.strftime('%m'))}"
+
+
+def format_event_timestamp(value: Any) -> str:
+    text = first_clean(value)
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return f"{parsed.day} {MONTHS.get(parsed.month, parsed.strftime('%m'))} {parsed.year} {parsed.strftime('%H:%M')}"
 
 
 def split_pickup_location(location: str) -> tuple[str, str]:

@@ -487,3 +487,65 @@ def test_reconcile_vinted_carrier_links_removes_duplicate_vinted_record():
     assert changed == ["chronopost:xu152297803jf"]
     assert "vinted:1778051829299958" not in packages
     assert packages["chronopost:xu152297803jf"]["extra"]["vinted_item_title"] == "5 artikelen"
+
+
+def test_chronopost_in_transit_refresh_preserves_vinted_eta():
+    record = {
+        "carrier": "chronopost",
+        "shop": "Vinted",
+        "tracking_code": "XU152297803JF",
+        "status": "in_transit",
+        "expected_date": "2026-05-11",
+        "extra": {
+            "vinted_item_title": "5 artikelen",
+            "expected_date_end": "2026-05-13",
+            "vinted_cross_reference": {
+                "expected_date": "2026-05-11",
+                "vinted_expected_date_to": "2026-05-13",
+            },
+        },
+    }
+
+    merged = merge_tracking_update(
+        record,
+        {
+            "carrier": "chronopost",
+            "tracking_code": "XU152297803JF",
+            "status": "in_transit",
+            "tracking_status_text": "Parcel in transit",
+        },
+        "2026-05-07T13:00:00+02:00",
+    )
+
+    assert merged["expected_date"] == "2026-05-11"
+    assert merged["extra"]["expected_date_end"] == "2026-05-13"
+
+
+def test_chronopost_refresh_promotes_vinted_cross_reference_eta_start():
+    record = {
+        "carrier": "chronopost",
+        "shop": "Vinted",
+        "tracking_code": "XU152297803JF",
+        "status": "in_transit",
+        "extra": {
+            "vinted_item_title": "5 artikelen",
+            "expected_date_end": "2026-05-13",
+            "vinted_cross_reference": {
+                "expected_date": "2026-05-11",
+                "expected_date_end": "2026-05-13",
+            },
+        },
+    }
+
+    merged = merge_tracking_update(
+        record,
+        {
+            "carrier": "chronopost",
+            "tracking_code": "XU152297803JF",
+            "status": "in_transit",
+            "tracking_status_text": "Parcel in transit",
+        },
+        "2026-05-07T14:00:00+02:00",
+    )
+
+    assert merged["expected_date"] == "2026-05-11"

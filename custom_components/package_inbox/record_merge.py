@@ -174,7 +174,15 @@ def merge_tracking_update(
     ):
         merged["pickup_location"] = None
         merged["pickup_code"] = None
-    if carrier == "chronopost" and update.get("status") == STATUS_IN_TRANSIT:
+    if not merged.get("expected_date"):
+        vinted_expected = _vinted_expected_start(merged)
+        if vinted_expected:
+            merged["expected_date"] = vinted_expected
+    if (
+        carrier == "chronopost"
+        and update.get("status") == STATUS_IN_TRANSIT
+        and not _record_has_vinted_expected_detail(merged)
+    ):
         merged["expected_date"] = None
         merged["delivery_window_start"] = None
         merged["delivery_window_end"] = None
@@ -377,6 +385,30 @@ def _record_has_vinted_context(record: dict[str, Any]) -> bool:
         or bool(extra.get("vinted_cross_reference"))
         or any(extra.get(key) for key in VINTED_DETAIL_EXTRA_KEYS)
     )
+
+
+def _record_has_vinted_expected_detail(record: dict[str, Any]) -> bool:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    cross_reference = extra.get("vinted_cross_reference")
+    cross_reference = cross_reference if isinstance(cross_reference, dict) else {}
+    return bool(
+        _record_has_vinted_context(record)
+        and (
+            record.get("expected_date")
+            or extra.get("expected_date_end")
+            or extra.get("vinted_expected_date_to")
+            or cross_reference.get("expected_date")
+            or cross_reference.get("expected_date_end")
+            or cross_reference.get("vinted_expected_date_to")
+        )
+    )
+
+
+def _vinted_expected_start(record: dict[str, Any]) -> Any:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    cross_reference = extra.get("vinted_cross_reference")
+    cross_reference = cross_reference if isinstance(cross_reference, dict) else {}
+    return cross_reference.get("expected_date") or extra.get("vinted_expected_date_from")
 
 
 def _vinted_record_has_linkable_detail(record: dict[str, Any]) -> bool:

@@ -25,10 +25,16 @@ from addons.parcels_fedex_scraper.app.main import (
     vinted_page_looks_logged_out,
     vinted_text_looks_register_form,
     vinted_carrier_tracking_from_values,
-    vinted_api_result_needs_pickup_enrichment,
+    vinted_api_result_needs_browser_enrichment,
+    vinted_browser_cookies_from_cookie_string,
+    vinted_carrier_tracking,
+    vinted_known_conversation_ids_from_payload,
+    vinted_known_threads_missing,
     vinted_pickup_deadline,
     vinted_pickup_point_from_any,
+    vinted_records_need_browser_enrichment,
     vinted_records_need_pickup_enrichment,
+    vinted_tracking_page_url_from_values,
 )
 
 
@@ -41,6 +47,40 @@ def test_sidecar_settings_include_disabled_vinted_auto_login_by_default():
     assert settings.vinted_browser_ui is False
     assert settings.vinted_accounts == ()
     assert vinted_configured(settings) is False
+
+
+def test_vinted_known_conversation_ids_from_payload_dedupes_urls_and_ids():
+    assert vinted_known_conversation_ids_from_payload(
+        {
+            "known_conversation_ids": ["21173058040"],
+            "source_urls": ["https://www.vinted.nl/inbox/21173058040", "https://www.vinted.nl/inbox/991234"],
+            "thread_ids": ["991234", "abc-1234"],
+        }
+    ) == ("21173058040", "991234", "1234")
+
+
+def test_vinted_known_threads_missing_checks_stored_thread_context():
+    assert not vinted_known_threads_missing(
+        [
+            {
+                "extra": {
+                    "vinted_thread_id": "22369923242",
+                    "vinted_source_url": "https://www.vinted.nl/inbox/22283644668",
+                }
+            }
+        ],
+        ("22369923242", "22283644668"),
+    )
+    assert vinted_known_threads_missing([{"extra": {"vinted_thread_id": "22369923242"}}], ("22369923242", "99"))
+
+
+def test_vinted_browser_cookies_from_cookie_string_filters_allowed_cookie_names():
+    cookies = vinted_browser_cookies_from_cookie_string(
+        "access_token_web=abc; refresh_token_web=def; not_allowed=secret"
+    )
+
+    assert [cookie["name"] for cookie in cookies] == ["access_token_web", "refresh_token_web"]
+    assert all(cookie["domain"] == ".vinted.nl" for cookie in cookies)
 
 
 def test_sidecar_settings_enable_vinted_auto_login_from_options():
@@ -435,8 +475,8 @@ def test_vinted_pickup_enrichment_detects_half_api_records_only():
     )
 
 
-def test_vinted_api_result_needs_pickup_enrichment_only_for_ok_half_pickups():
-    assert vinted_api_result_needs_pickup_enrichment(
+def test_vinted_api_result_needs_browser_enrichment_for_ok_half_pickups():
+    assert vinted_api_result_needs_browser_enrichment(
         {
             "status": "ok",
             "records": [
@@ -448,7 +488,7 @@ def test_vinted_api_result_needs_pickup_enrichment_only_for_ok_half_pickups():
             ],
         }
     )
-    assert not vinted_api_result_needs_pickup_enrichment(
+    assert not vinted_api_result_needs_browser_enrichment(
         {
             "status": "api_auth_failed",
             "records": [
@@ -458,6 +498,79 @@ def test_vinted_api_result_needs_pickup_enrichment_only_for_ok_half_pickups():
                 }
             ],
         }
+    )
+
+
+def test_vinted_missing_tracking_link_does_not_force_default_browser_enrichment():
+    assert not vinted_records_need_browser_enrichment(
+        [
+            {
+                "carrier": "vinted",
+                "status": "in_transit",
+                "tracking_code": "1778051829299958",
+                "extra": {
+                    "vinted_source_url": "https://www.vinted.nl/inbox/99",
+                    "vinted_item_title": "5 artikelen",
+                },
+            }
+        ]
+    )
+    assert not vinted_records_need_browser_enrichment(
+        [
+            {
+                "carrier": "vinted",
+                "status": "in_transit",
+                "tracking_code": "1778051829299958",
+                "extra": {
+                    "vinted_source_url": "https://www.vinted.nl/inbox/99",
+                    "vinted_tracking_page_url": "https://carrier.example/track/1778051829299958",
+                    "vinted_item_title": "5 artikelen",
+                },
+            }
+        ]
+    )
+
+
+def test_vinted_text_extracts_chronopost_link_from_tracking_modal():
+    record = vinted_record_from_text(
+        """
+        Trackingcode XU152297803JF
+        Verwachte levertijd mei 06 - mei 08
+        Trackinginformatie
+        Onderweg 6 mei 2026 om 21:09
+        https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF&langue=nl
+        """,
+        account_key="account_1",
+        source_url="https://www.vinted.nl/inbox/123",
+    )
+
+    assert record is not None
+    assert record["tracking_url"].startswith("https://www.chronopost.fr/")
+    assert record["expected_date"] == "2026-05-06"
+    assert record["extra"]["expected_date_end"] == "2026-05-08"
+    assert record["extra"]["tracking_events"] == [{"status": "Onderweg", "timestamp": "2026-05-06T21:09:00"}]
+    assert record["extra"]["carrier_tracking"] == {
+        "carrier": "chronopost",
+        "tracking_code": "XU152297803JF",
+        "tracking_url": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF&langue=nl",
+    }
+    assert record["extra"]["vinted_tracking_page_url"].startswith("https://www.chronopost.fr/")
+
+
+def test_vinted_carrier_tracking_extracts_chronopost_url():
+    assert vinted_carrier_tracking(
+        "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF&langue=nl"
+    ) == {
+        "carrier": "chronopost",
+        "tracking_code": "XU152297803JF",
+        "tracking_url": "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF&langue=nl",
+    }
+    assert (
+        vinted_tracking_page_url_from_values(
+            None,
+            "klik https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF&langue=nl",
+        )
+        == "https://www.chronopost.fr/tracking-no-cms/suivi-page?listeNumerosLT=XU152297803JF&langue=nl"
     )
 
 

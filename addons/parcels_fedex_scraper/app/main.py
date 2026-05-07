@@ -555,6 +555,8 @@ async def vinted_browser_ui_close(request: web.Request) -> web.Response:
 async def vinted_parcels(request: web.Request) -> web.Response:
     account_key = None
     debug = request.query.get("debug") == "1"
+    browser_replay = False
+    known_conversation_ids: tuple[str, ...] = ()
     try:
         payload = await request.json() if request.can_read_body else {}
     except Exception:
@@ -562,7 +564,16 @@ async def vinted_parcels(request: web.Request) -> web.Response:
     if isinstance(payload, dict):
         account_key = str(payload.get("account") or payload.get("account_key") or "").strip() or None
         debug = debug or parse_bool(payload.get("debug"), False)
-    result = await scrape_vinted_parcels(request.app, account_key=account_key, debug=debug)
+        browser_replay = parse_bool(payload.get("browser_replay"), False)
+        known_conversation_ids = vinted_known_conversation_ids_from_payload(payload)
+    browser_replay = browser_replay or debug
+    result = await scrape_vinted_parcels(
+        request.app,
+        account_key=account_key,
+        debug=debug,
+        browser_replay=browser_replay,
+        known_conversation_ids=known_conversation_ids,
+    )
     return web.json_response(result)
 
 
@@ -1537,11 +1548,79 @@ def vinted_configured(settings: Settings) -> bool:
     return bool(settings.vinted_accounts)
 
 
+def vinted_known_conversation_ids_from_payload(payload: dict[str, Any]) -> tuple[str, ...]:
+    values: list[Any] = []
+    for key in ("known_conversation_ids", "conversation_ids", "thread_ids"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+        elif value not in (None, ""):
+            values.append(value)
+    source_urls = payload.get("source_urls")
+    if isinstance(source_urls, list):
+        values.extend(source_urls)
+
+    results: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = re.search(r"(?:/inbox/|conversation[_-]?id[=/])(\d{4,})", text, re.IGNORECASE)
+        conversation_id = match.group(1) if match else re.sub(r"\D", "", text)
+        if len(conversation_id) >= 4 and conversation_id not in results:
+            results.append(conversation_id)
+    return tuple(results[:40])
+
+
+def vinted_known_threads_missing(records: list[Any], known_conversation_ids: tuple[str, ...]) -> bool:
+    if not known_conversation_ids:
+        return False
+    seen: set[str] = set()
+    for record in records:
+        if isinstance(record, dict):
+            seen.update(vinted_record_thread_ids(record))
+    return any(conversation_id not in seen for conversation_id in known_conversation_ids)
+
+
+def vinted_record_thread_id(record: dict[str, Any]) -> str:
+    ids = vinted_record_thread_ids(record)
+    return ids[0] if ids else ""
+
+
+def vinted_record_thread_ids(record: dict[str, Any]) -> tuple[str, ...]:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    values = [
+        extra.get("vinted_thread_id"),
+        (extra.get("vinted_cross_reference") or {}).get("vinted_thread_id")
+        if isinstance(extra.get("vinted_cross_reference"), dict)
+        else None,
+        extra.get("vinted_source_url"),
+        record.get("tracking_url"),
+    ]
+    results: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = re.search(r"/inbox/(\d{4,})", text)
+        if match:
+            conversation_id = match.group(1)
+        elif text.isdigit():
+            conversation_id = text
+        else:
+            continue
+        if conversation_id not in results:
+            results.append(conversation_id)
+    return tuple(results)
+
+
 async def scrape_vinted_parcels(
     app: web.Application,
     *,
     account_key: str | None = None,
     debug: bool = False,
+    browser_replay: bool = False,
+    known_conversation_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     settings: Settings = app["settings"]
     if not vinted_configured(settings):
@@ -1570,7 +1649,11 @@ async def scrape_vinted_parcels(
     for account in accounts:
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(fetch_vinted_api_records_sync, account),
+                asyncio.to_thread(
+                    fetch_vinted_api_records_sync,
+                    account,
+                    known_conversation_ids=known_conversation_ids,
+                ),
                 timeout=api_timeout,
             )
         except TimeoutError:
@@ -1587,10 +1670,26 @@ async def scrape_vinted_parcels(
                 debug=debug,
                 timeout=per_account_timeout,
                 api_result=result,
+                known_conversation_ids=known_conversation_ids,
             )
-        elif vinted_records_need_pickup_enrichment(
-            result.get("records") if isinstance(result.get("records"), list) else []
-        ):
+        else:
+            result_records = result.get("records") if isinstance(result.get("records"), list) else []
+            needs_known_replay = browser_replay and vinted_known_threads_missing(result_records, known_conversation_ids)
+            needs_enrichment = vinted_records_need_browser_enrichment(result_records)
+            if not (needs_known_replay or needs_enrichment):
+                account_records = result.get("records") if isinstance(result.get("records"), list) else []
+                records.extend(record for record in account_records if isinstance(record, dict))
+                account_results.append(
+                    {
+                        "key": account.key,
+                        "status": result.get("status") or "unknown",
+                        "record_count": len(account_records),
+                        "diagnostics": result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {},
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                continue
+
             enrichment_timeout = max(per_account_timeout, int(settings.timeout))
             enriched_result = await run_vinted_browser_fallback(
                 app,
@@ -1598,6 +1697,7 @@ async def scrape_vinted_parcels(
                 debug=debug,
                 timeout=enrichment_timeout,
                 api_result=result,
+                known_conversation_ids=known_conversation_ids,
             )
             enriched_records = (
                 enriched_result.get("records") if isinstance(enriched_result.get("records"), list) else []
@@ -1605,6 +1705,7 @@ async def scrape_vinted_parcels(
             enrichment_diagnostics = {
                 "status": enriched_result.get("status") or "unknown",
                 "records": len(enriched_records),
+                "known_thread_replay": needs_known_replay,
             }
             result_diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
             if enriched_records:
@@ -1619,7 +1720,7 @@ async def scrape_vinted_parcels(
                     ),
                     "diagnostics": {
                         **result_diagnostics,
-                        "browser_pickup_enrichment": enrichment_diagnostics,
+                        "browser_tracking_enrichment": enrichment_diagnostics,
                     },
                 }
             else:
@@ -1627,7 +1728,7 @@ async def scrape_vinted_parcels(
                     **result,
                     "diagnostics": {
                         **result_diagnostics,
-                        "browser_pickup_enrichment": enrichment_diagnostics,
+                        "browser_tracking_enrichment": enrichment_diagnostics,
                     },
                 }
 
@@ -1665,9 +1766,9 @@ def vinted_account_state(app: web.Application, account: VintedAccount) -> dict[s
     return state if isinstance(state, dict) else {}
 
 
-def vinted_api_result_needs_pickup_enrichment(api_result: dict[str, Any]) -> bool:
+def vinted_api_result_needs_browser_enrichment(api_result: dict[str, Any]) -> bool:
     records = api_result.get("records") if isinstance(api_result.get("records"), list) else []
-    return api_result.get("status") == "ok" and vinted_records_need_pickup_enrichment(records)
+    return api_result.get("status") == "ok" and vinted_records_need_browser_enrichment(records)
 
 
 def vinted_login_needs_manual_attention(status: str) -> bool:
@@ -1807,6 +1908,29 @@ def vinted_cookie_from_values(cookie_values: dict[str, str]) -> str:
     )
 
 
+def vinted_browser_cookies_from_cookie_string(cookie: str) -> list[dict[str, Any]]:
+    cookies: list[dict[str, Any]] = []
+    for part in clean_vinted_cookie_string(cookie).split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.strip().split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value or not allowed_vinted_cookie_name(name):
+            continue
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": ".vinted.nl",
+                "path": "/",
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        )
+    return cookies
+
+
 async def run_vinted_browser_fallback(
     app: web.Application,
     *,
@@ -1814,6 +1938,7 @@ async def run_vinted_browser_fallback(
     debug: bool,
     timeout: int,
     api_result: dict[str, Any],
+    known_conversation_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     settings: Settings = app["settings"]
     state = vinted_account_state(app, account)
@@ -1869,7 +1994,7 @@ async def run_vinted_browser_fallback(
                     "api_client": api_result.get("diagnostics") if isinstance(api_result.get("diagnostics"), dict) else {},
                 },
             }
-        if settings.vinted_auto_login and state_status != "ok" and not vinted_api_result_needs_pickup_enrichment(api_result):
+        if settings.vinted_auto_login and state_status != "ok" and not vinted_api_result_needs_browser_enrichment(api_result):
             login_timeout = min(timeout, vinted_login_attempt_timeout(settings))
             try:
                 login_result = await asyncio.wait_for(
@@ -1902,7 +2027,14 @@ async def run_vinted_browser_fallback(
                 }
         try:
             result = await asyncio.wait_for(
-                run_vinted_parcel_scrape(app, account=account, debug=debug, use_api=False, api_result=api_result),
+                run_vinted_parcel_scrape(
+                    app,
+                    account=account,
+                    debug=debug,
+                    use_api=False,
+                    api_result=api_result,
+                    known_conversation_ids=known_conversation_ids,
+                ),
                 timeout=timeout,
             )
         except TimeoutError:
@@ -1917,7 +2049,14 @@ async def run_vinted_browser_fallback(
             await run_vinted_login(app, reason="parcel_scrape_retry", account=account)
             try:
                 result = await asyncio.wait_for(
-                    run_vinted_parcel_scrape(app, account=account, debug=debug, use_api=False, api_result=api_result),
+                    run_vinted_parcel_scrape(
+                        app,
+                        account=account,
+                        debug=debug,
+                        use_api=False,
+                        api_result=api_result,
+                        known_conversation_ids=known_conversation_ids,
+                    ),
                     timeout=timeout,
                 )
             except TimeoutError:
@@ -2003,12 +2142,17 @@ async def close_vinted_context(context) -> None:
         LOG.warning("Vinted browser context close did not finish cleanly: %s", type(err).__name__)
 
 
-def fetch_vinted_api_records_sync(account: VintedAccount) -> dict[str, Any]:
+def fetch_vinted_api_records_sync(
+    account: VintedAccount,
+    *,
+    known_conversation_ids: tuple[str, ...] = (),
+) -> dict[str, Any]:
     request_timeout = 8
     session_cookie = account.session_cookie or stored_vinted_session_cookie(account.key)
     diagnostics: dict[str, Any] = {
         "method": "session_cookie" if session_cookie else "password_oauth",
         "inbox_summaries": 0,
+        "known_conversations": len(known_conversation_ids),
         "conversations_checked": 0,
         "packages": 0,
     }
@@ -2182,6 +2326,11 @@ def fetch_vinted_api_records_sync(account: VintedAccount) -> dict[str, Any]:
         inbox = get_json("/api/v2/inbox")
         summaries = inbox.get("conversations")
         summaries = [item for item in summaries[:25] if isinstance(item, dict)] if isinstance(summaries, list) else []
+        seen_summary_ids = {str(item.get("id")) for item in summaries if item.get("id") not in (None, "")}
+        for conversation_id in known_conversation_ids:
+            if conversation_id not in seen_summary_ids:
+                summaries.append({"id": conversation_id})
+                seen_summary_ids.add(conversation_id)
         diagnostics["inbox_summaries"] = len(summaries)
 
         records: list[dict[str, Any]] = []
@@ -2231,6 +2380,7 @@ async def run_vinted_parcel_scrape(
     debug: bool = False,
     use_api: bool = True,
     api_result: dict[str, Any] | None = None,
+    known_conversation_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     settings: Settings = app["settings"]
     if use_api:
@@ -2243,18 +2393,36 @@ async def run_vinted_parcel_scrape(
         **(api_result.get("diagnostics") if isinstance(api_result.get("diagnostics"), dict) else {}),
     }
 
-    playwright = app["playwright"]
     account.profile_dir.mkdir(parents=True, exist_ok=True)
     context = None
-    context = await asyncio.wait_for(
-        playwright.chromium.launch_persistent_context(
-            user_data_dir=str(account.profile_dir),
-            headless=settings.headless,
-            locale="nl-NL",
-            args=vinted_chromium_args(),
-        ),
-        timeout=vinted_browser_launch_timeout(settings),
-    )
+    targeted_known_replay = bool(known_conversation_ids) and not debug
+    session_cookie = account.session_cookie or stored_vinted_session_cookie(account.key)
+    if targeted_known_replay and session_cookie:
+        browser = await get_shared_browser(app)
+        context = await asyncio.wait_for(
+            browser.new_context(
+                locale="nl-NL",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+                ),
+            ),
+            timeout=vinted_browser_launch_timeout(settings),
+        )
+        cookies = vinted_browser_cookies_from_cookie_string(session_cookie)
+        if cookies:
+            await context.add_cookies(cookies)
+    else:
+        playwright = app["playwright"]
+        context = await asyncio.wait_for(
+            playwright.chromium.launch_persistent_context(
+                user_data_dir=str(account.profile_dir),
+                headless=settings.headless,
+                locale="nl-NL",
+                args=vinted_chromium_args(),
+            ),
+            timeout=vinted_browser_launch_timeout(settings),
+        )
     await prepare_vinted_context(context)
     page = context.pages[0] if context.pages else await context.new_page()
     json_payloads: list[tuple[str, Any]] = []
@@ -2267,10 +2435,17 @@ async def run_vinted_parcel_scrape(
         "detail_links": 0,
         "text_chars": 0,
         "json_payloads": 0,
+        "known_conversations": len(known_conversation_ids),
     }
     debug_samples: list[str] = []
     preflight_records = api_result.get("records") if isinstance(api_result.get("records"), list) else []
-    needs_pickup_enrichment = debug or vinted_records_need_pickup_enrichment(preflight_records)
+    needs_browser_enrichment = debug or bool(known_conversation_ids) or vinted_records_need_browser_enrichment(
+        preflight_records
+    )
+    for conversation_id in known_conversation_ids:
+        link = urljoin(VINTED_HOME, f"/inbox/{conversation_id}")
+        if link not in detail_links:
+            detail_links.append(link)
     for link in vinted_detail_links_from_records(preflight_records):
         if link not in detail_links:
             detail_links.append(link)
@@ -2292,31 +2467,33 @@ async def run_vinted_parcel_scrape(
         if not await vinted_page_looks_logged_in(page):
             return {"status": "login_required", "records": [], "diagnostics": diagnostics}
 
-        for source_url, payload in await fetch_vinted_api_payloads(context, settings):
-            json_payloads.append((source_url, payload))
+        if not targeted_known_replay:
+            for source_url, payload in await fetch_vinted_api_payloads(context, settings):
+                json_payloads.append((source_url, payload))
         diagnostics["api_payloads"] = len(json_payloads)
 
-        for path in VINTED_PARCEL_PATHS:
-            url = urljoin(VINTED_HOME, path)
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=vinted_page_timeout(settings) * 1000)
-            except PlaywrightError:
-                continue
-            await dismiss_vinted_overlays(page)
-            await wait_for_vinted_settle(page, settings.timeout)
-            text = await safe_body_text(page)
-            if text:
-                page_texts.append((url, text))
-                diagnostics["text_chars"] += len(text)
-                if debug:
-                    debug_samples.append(redact_vinted_debug_text(f"{url}\n{text}")[:1200])
-            for link in await extract_vinted_detail_links(page):
-                if link not in detail_links:
-                    detail_links.append(link)
-            diagnostics["pages"] += 1
+        if not targeted_known_replay:
+            for path in VINTED_PARCEL_PATHS:
+                url = urljoin(VINTED_HOME, path)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=vinted_page_timeout(settings) * 1000)
+                except PlaywrightError:
+                    continue
+                await dismiss_vinted_overlays(page)
+                await wait_for_vinted_settle(page, settings.timeout)
+                text = await safe_body_text(page)
+                if text:
+                    page_texts.append((url, text))
+                    diagnostics["text_chars"] += len(text)
+                    if debug:
+                        debug_samples.append(redact_vinted_debug_text(f"{url}\n{text}")[:1200])
+                for link in await extract_vinted_detail_links(page):
+                    if link not in detail_links:
+                        detail_links.append(link)
+                diagnostics["pages"] += 1
 
         diagnostics["detail_links"] = len(detail_links)
-        detail_limit = 8 if needs_pickup_enrichment else 2
+        detail_limit = min(12, max(len(detail_links), 2)) if targeted_known_replay else (8 if needs_browser_enrichment else 2)
         for url in detail_links[:detail_limit]:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=vinted_page_timeout(settings) * 1000)
@@ -2324,10 +2501,10 @@ async def run_vinted_parcel_scrape(
                 continue
             await dismiss_vinted_overlays(page)
             await wait_for_vinted_settle(page, settings.timeout)
-            if needs_pickup_enrichment:
+            if needs_browser_enrichment:
                 await click_vinted_tracking_control(page)
                 await wait_for_vinted_settle(page, settings.timeout)
-            text = await safe_body_text(page)
+            text = await vinted_tracking_detail_text(page)
             if text:
                 page_texts.append((url, text))
                 diagnostics["text_chars"] += len(text)
@@ -2341,7 +2518,7 @@ async def run_vinted_parcel_scrape(
         records: list[dict[str, Any]] = []
         for source_url, payload in json_payloads:
             records.extend(vinted_records_from_json(payload, account_key=account.key, source_url=source_url))
-        if records and not vinted_records_need_pickup_enrichment(records):
+        if records and not known_conversation_ids and not vinted_records_need_browser_enrichment(records):
             return {"status": "ok", "records": dedupe_vinted_records(records), "diagnostics": diagnostics}
         for source_url, text in page_texts:
             record = vinted_record_from_text(text, account_key=account.key, source_url=source_url)
@@ -2432,7 +2609,7 @@ async def extract_vinted_detail_links(page) -> list[str]:
 def vinted_detail_links_from_records(records: list[Any]) -> list[str]:
     links: list[str] = []
     for record in records:
-        if not vinted_record_needs_pickup_enrichment(record):
+        if not vinted_record_needs_browser_enrichment(record):
             continue
         extra = record.get("extra") if isinstance(record, dict) and isinstance(record.get("extra"), dict) else {}
         for value in (extra.get("vinted_source_url"), record.get("tracking_url") if isinstance(record, dict) else None):
@@ -2440,6 +2617,57 @@ def vinted_detail_links_from_records(records: list[Any]) -> list[str]:
             if link.startswith(VINTED_HOME) and link not in links:
                 links.append(link)
     return links[:8]
+
+
+async def vinted_tracking_detail_text(page) -> str:
+    text = await safe_body_text(page)
+    links = await vinted_tracking_links_from_page(page)
+    pieces = [text, *links]
+    return "\n".join(piece for piece in pieces if piece)
+
+
+async def vinted_tracking_links_from_page(page) -> list[str]:
+    try:
+        links = await page.locator("a[href]").evaluate_all(
+            """
+            els => els
+              .map(a => a.href || "")
+              .filter(h => /^https?:\\/\\//i.test(h))
+            """
+        )
+    except PlaywrightError:
+        return []
+    results: list[str] = []
+    for link in links:
+        text = str(link or "").split("#", 1)[0].strip()
+        if not text or text in results:
+            continue
+        if is_vinted_tracking_href(text):
+            results.append(text)
+    return results[:10]
+
+
+def is_vinted_tracking_href(value: str) -> bool:
+    lowered = str(value or "").lower()
+    if not lowered.startswith(("http://", "https://")):
+        return False
+    if "vinted.nl" in lowered:
+        return False
+    return any(
+        hint in lowered
+        for hint in (
+            "chronopost",
+            "dpd.",
+            "dhl",
+            "postnl",
+            "gls",
+            "homerr",
+            "vintedgo",
+            "tracking",
+            "track",
+            "suivi",
+        )
+    )
 
 
 async def click_vinted_tracking_control(page) -> bool:
@@ -3026,6 +3254,10 @@ def vinted_package_from_conversation(
             ),
         )
     )
+    tracking_page_url = vinted_tracking_page_url_from_values(
+        vinted_as_str(vinted_first_key_contains(combined, ("tracking", "url"))),
+        text,
+    )
     carrier = vinted_as_str(
         vinted_first_by_keys(
             combined,
@@ -3112,6 +3344,7 @@ def vinted_package_from_conversation(
         "other_party": other_party,
         "carrier": carrier,
         "tracking_code": tracking_code,
+        "tracking_page_url": tracking_page_url,
         "pickup_point": pickup_point,
         "pickup_deadline": date_from_any(pickup_deadline) or pickup_deadline,
         "pickup_code": re.sub(r"[^A-Z0-9]", "", pickup_code.upper()) if pickup_code else None,
@@ -3141,6 +3374,10 @@ def vinted_record_from_api_package(
         tracking_code=vinted_as_str(package.get("tracking_code")),
         text=str(package.get("raw_text") or ""),
     )
+    tracking_page_url = vinted_as_str(package.get("tracking_page_url")) or vinted_tracking_page_url_from_values(
+        None,
+        str(package.get("raw_text") or ""),
+    )
     package_id = vinted_as_str(package.get("package_id")) or vinted_stable_text_id(str(package))
     tracking_code = (
         carrier_reference.get("tracking_code")
@@ -3159,7 +3396,7 @@ def vinted_record_from_api_package(
         "status": status,
         "source": "vinted_sidecar",
         "confidence": "high",
-        "tracking_url": carrier_reference.get("tracking_url") if carrier_reference else source_url,
+        "tracking_url": carrier_reference.get("tracking_url") if carrier_reference else tracking_page_url or source_url,
         "tracking_status_text": vinted_api_status_text(package, status=status),
         "tracking_refresh_source": "vinted_sidecar_api",
         "tracking_refresh_supported": True,
@@ -3189,6 +3426,8 @@ def vinted_record_from_api_package(
         record["extra"]["pickup_deadline"] = package["pickup_deadline"]
     if carrier_reference:
         record["extra"]["carrier_tracking"] = carrier_reference
+    if tracking_page_url:
+        record["extra"]["vinted_tracking_page_url"] = tracking_page_url
     return record
 
 
@@ -3480,6 +3719,17 @@ def vinted_datetime_from_any(value: Any) -> str:
             f"{int(match.group(3)):04d}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
             f"T{int(match.group(4)):02d}:{match.group(5)}:00"
         )
+    folded = fold_text(text)
+    month_names = "|".join(sorted(map(re.escape, VINTED_MONTHS), key=len, reverse=True))
+    match = re.search(
+        rf"\b(\d{{1,2}})\s+({month_names})\s+(20\d{{2}})(?:\s+(?:om|at))?\s+([0-2]?\d)[:.]([0-5]\d)\b",
+        folded,
+    )
+    if match:
+        return (
+            f"{int(match.group(3)):04d}-{VINTED_MONTHS[match.group(2)]:02d}-{int(match.group(1)):02d}"
+            f"T{int(match.group(4)):02d}:{match.group(5)}:00"
+        )
     return ""
 
 
@@ -3490,14 +3740,19 @@ def vinted_tracking_events_from_text(text: str) -> list[dict[str, str]]:
         r"In transit|Shipped|Tracking code created(?:\s*-\s*[A-Z0-9]{8,40})?|"
         r"Klaar om op te halen|Ready for pickup|Afgeleverd|Delivered"
     )
+    month_names = "|".join(sorted(map(re.escape, VINTED_MONTHS), key=len, reverse=True))
+    datetime_pattern = (
+        rf"(?:\d{{1,2}}[-/]\d{{1,2}}[-/]20\d{{2}}|\d{{1,2}}\s+(?:{month_names})\s+20\d{{2}})"
+        r"(?:,|\s+om|\s+at)?\s+([0-2]?\d[:.][0-5]\d)"
+    )
     events: list[dict[str, str]] = []
     for match in re.finditer(
-        rf"\b({status_pattern})\b\s+(\d{{1,2}}[-/]\d{{1,2}}[-/]20\d{{2}}),?\s+([0-2]?\d[:.][0-5]\d)",
+        rf"\b({status_pattern})\b\s+({datetime_pattern})",
         normalized,
         re.IGNORECASE,
     ):
         status = clean_location_piece(match.group(1))
-        timestamp = vinted_datetime_from_any(f"{match.group(2)}, {match.group(3)}")
+        timestamp = vinted_datetime_from_any(match.group(2))
         if not timestamp:
             continue
         event = {"status": vinted_event_status_label(status), "timestamp": timestamp}
@@ -3777,6 +4032,7 @@ def vinted_record_from_text(
     pickup_code = vinted_pickup_code(text)
     pickup_location = vinted_pickup_location(text) if status == "ready_for_pickup" else ""
     carrier_reference = vinted_carrier_tracking(text)
+    tracking_page_url = vinted_tracking_page_url_from_values(None, text)
     expected_date, expected_date_to = vinted_expected_delivery_range({}, text)
     deadline = vinted_pickup_deadline(text)
     item_title = vinted_item_title_from_text(text)
@@ -3800,7 +4056,7 @@ def vinted_record_from_text(
         "status": status,
         "source": "vinted_sidecar",
         "confidence": "high",
-        "tracking_url": carrier_reference.get("tracking_url") if carrier_reference else source_url,
+        "tracking_url": carrier_reference.get("tracking_url") if carrier_reference else tracking_page_url or source_url,
         "tracking_status_text": vinted_status_text(text, status=status),
         "tracking_refresh_source": "vinted_sidecar",
         "tracking_refresh_supported": True,
@@ -3830,6 +4086,8 @@ def vinted_record_from_text(
         record["extra"]["vinted_id"] = vinted_id
     if carrier_reference:
         record["extra"]["carrier_tracking"] = carrier_reference
+    if tracking_page_url:
+        record["extra"]["vinted_tracking_page_url"] = tracking_page_url
     return record
 
 
@@ -3961,6 +4219,10 @@ def vinted_tracking_code_from_text(text: str) -> str:
 
 def vinted_carrier_tracking(text: str) -> dict[str, str]:
     urls = extract_urls(text)
+    for url in urls:
+        reference = vinted_carrier_tracking_from_url(url)
+        if reference:
+            return reference
     folded = fold_text(text)
     patterns = (
         ("chronopost", r"\bXU[A-Z0-9]{8,24}\b", ("chronopost",)),
@@ -3983,6 +4245,44 @@ def vinted_carrier_tracking(text: str) -> dict[str, str]:
                 break
         return reference
     return {}
+
+
+def vinted_carrier_tracking_from_url(url: str) -> dict[str, str]:
+    text = str(url or "")
+    folded = text.lower()
+    carrier = ""
+    code = ""
+    if "chronopost" in folded:
+        carrier = "chronopost"
+        match = re.search(r"\bXU[A-Z0-9]{8,24}\b", text, re.IGNORECASE)
+        code = match.group(0).upper() if match else ""
+    elif "dpd" in folded:
+        carrier = "dpd"
+        match = re.search(r"(?:parcelNumber|parcel|pkn|reference|trackingNumber)=([A-Z0-9]{10,24})", text, re.IGNORECASE)
+        code = re.sub(r"[^A-Z0-9]", "", match.group(1).upper()) if match else ""
+    elif "dhl" in folded:
+        carrier = "dhl"
+        match = re.search(r"\b(?:JJD[A-Z0-9]{12,32}|3S[A-Z0-9]{8,24})\b", text, re.IGNORECASE)
+        code = match.group(0).upper() if match else ""
+    elif "postnl" in folded:
+        carrier = "postnl"
+        match = re.search(r"\b3S[A-Z0-9]{8,24}\b", text, re.IGNORECASE)
+        code = match.group(0).upper() if match else ""
+    elif "gls" in folded:
+        carrier = "gls"
+        match = re.search(r"(?:match|parcelNumber|trackingNumber)=([A-Z0-9]{8,24})", text, re.IGNORECASE)
+        code = re.sub(r"[^A-Z0-9]", "", match.group(1).upper()) if match else ""
+    if not carrier or not code:
+        return {}
+    return {"carrier": carrier, "tracking_code": code, "tracking_url": text}
+
+
+def vinted_tracking_page_url_from_values(url: str | None, text: str) -> str:
+    candidates = [str(url or "").strip(), *extract_urls(text)]
+    for candidate in candidates:
+        if candidate and is_vinted_tracking_href(candidate):
+            return candidate
+    return ""
 
 
 def extract_urls(text: str) -> list[str]:
@@ -4021,6 +4321,14 @@ def vinted_records_need_pickup_enrichment(records: list[Any]) -> bool:
     return any(vinted_record_needs_pickup_enrichment(record) for record in records)
 
 
+def vinted_records_need_browser_enrichment(records: list[Any]) -> bool:
+    return any(vinted_record_needs_browser_enrichment(record) for record in records)
+
+
+def vinted_record_needs_browser_enrichment(record: Any) -> bool:
+    return vinted_record_needs_pickup_enrichment(record)
+
+
 def vinted_record_needs_pickup_enrichment(record: Any) -> bool:
     if not isinstance(record, dict) or record.get("status") != "ready_for_pickup":
         return False
@@ -4035,6 +4343,22 @@ def vinted_record_needs_pickup_enrichment(record: Any) -> bool:
             extra.get("pickup_code"),
         )
     )
+
+
+def vinted_record_needs_tracking_link_enrichment(record: Any) -> bool:
+    """Return true when manual/debug browser enrichment could improve a Vinted record."""
+    if not isinstance(record, dict):
+        return False
+    status = str(record.get("status") or "")
+    if status not in {"in_transit", "expected_today", "ready_for_pickup"}:
+        return False
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    if not extra.get("vinted_source_url"):
+        return False
+    reference = extra.get("carrier_tracking") if isinstance(extra.get("carrier_tracking"), dict) else {}
+    if reference.get("tracking_url") or extra.get("vinted_tracking_page_url"):
+        return False
+    return True
 
 
 def vinted_record_key(record: dict[str, Any]) -> str:
