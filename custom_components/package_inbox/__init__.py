@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 from email import message_from_bytes, message_from_string, policy
 import base64
 import hashlib
@@ -78,6 +78,12 @@ from .const import (
     STORAGE_VERSION,
 )
 from .dashboard import build_dashboard_snapshot
+from .notifications import (
+    format_pickup_notification,
+    format_pickup_summary,
+    is_vinted_record,
+    notification_package_title,
+)
 from .parser import clean_text, is_likely_package_email, parse_email, stable_key
 from .record_merge import apply_vinted_cross_reference, merge_tracking_update, reconcile_vinted_carrier_links
 from .tracking import (
@@ -383,8 +389,26 @@ class PackageInboxManager:
         if vinted_records:
             stored = await self._async_store_records(vinted_records, notify=notify)
             refreshed.extend(stored)
+        stale_vinted_records = _stale_vinted_pickups_to_retire(packages, vinted_records)
+        stale_vinted_keys = {record["key"] for record in stale_vinted_records if record.get("key")}
+        if stale_vinted_records:
+            stored = await self._async_store_records(stale_vinted_records, notify=False)
+            refreshed.extend(stored)
+            diagnostics.append(
+                {
+                    "key": "vinted_sidecar_stale_retire",
+                    "carrier": "vinted",
+                    "status": STATUS_PICKED_UP,
+                    "source": "vinted_sidecar",
+                    "supported": True,
+                    "count": len(stale_vinted_records),
+                }
+            )
 
         for key, current in candidates:
+            if key in stale_vinted_keys:
+                skipped.append({"key": key, "reason": "stale_vinted_pickup_retired"})
+                continue
             record = _normalize_record(current)
             record["key"] = key
 
@@ -1284,24 +1308,7 @@ class PackageInboxManager:
 
     async def _async_notify_pickup(self, record: dict[str, Any]) -> None:
         carrier = _carrier_title(record.get("carrier"))
-        location = record.get("pickup_location")
-        code = record.get("pickup_code")
-        shop = record.get("shop")
-        display = _notification_package_title(record)
-
-        first_line = f"{display} pakket ligt klaar"
-        if location:
-            first_line += f" bij {location}"
-
-        lines = [first_line]
-        if carrier.lower() != display.lower():
-            lines.append(f"Vervoerder: {carrier}")
-        if shop and shop.lower() not in {carrier.lower(), display.lower()}:
-            lines.append(f"Van: {shop}")
-        if code:
-            lines.append(f"Code: {code}")
-
-        await self._async_send_text("\n\n".join([lines[0], "\n".join(lines[1:])]) if len(lines) > 1 else lines[0])
+        await self._async_send_text(format_pickup_notification(record))
 
         qr_file_path = record.get("qr_file_path")
         if qr_file_path:
@@ -1779,32 +1786,7 @@ class PackageInboxManager:
         return "\n".join(lines)
 
     def _format_pickup_summary(self, records: list[dict[str, Any]]) -> str:
-        count = len(records)
-        first = (
-            "Er ligt 1 pakket klaar om op te halen"
-            if count == 1
-            else f"Er liggen {count} pakketten klaar om op te halen"
-        )
-
-        lines = [first]
-        for record in records:
-            shop = record.get("shop") or _carrier_title(record.get("carrier"))
-            location = record.get("pickup_location")
-            code = record.get("pickup_code")
-            extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
-            deadline = extra.get("pickup_deadline") or record.get("pickup_deadline")
-
-            lines.append("")
-            lines.append(f"- {shop}")
-            if location:
-                lines.append(f"  Bij: {location}")
-            if code:
-                lines.append(f"  Code: {code}")
-            if deadline:
-                lines.append(f"  Ophalen voor: {deadline}")
-            if record.get("qr_file_path"):
-                lines.append("  QR: al meegestuurd")
-        return "\n".join(lines)
+        return format_pickup_summary(records)
 
     def _format_record_expected(self, record: dict[str, Any]) -> str | None:
         if record.get("status") == STATUS_READY_FOR_PICKUP:
@@ -1987,24 +1969,117 @@ def _tracking_diagnostic(key: str, record: dict[str, Any], update: dict[str, Any
 
 
 def _record_has_vinted_source(record: dict[str, Any]) -> bool:
-    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
-    return (
-        _carrier_slug(record.get("carrier")) == "vinted"
-        or clean_text(str(record.get("shop") or "")).lower() == "vinted"
-        or clean_text(str(record.get("source") or "")).lower().startswith("vinted")
-        or bool(extra.get("vinted_cross_reference"))
-    )
+    return is_vinted_record(record)
 
 
 def _notification_package_title(record: dict[str, Any]) -> str:
-    if _record_has_vinted_source(record):
+    return notification_package_title(record)
+
+
+def _stale_vinted_pickups_to_retire(
+    packages: dict[str, dict[str, Any]],
+    current_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    current_ids = _vinted_current_record_ids(current_records)
+    current_accounts = _vinted_current_accounts(current_records)
+    if not current_ids:
+        return []
+
+    retired: list[dict[str, Any]] = []
+    now = dt_util.now().isoformat()
+    for key, stored in packages.items():
+        record = _normalize_record(stored)
+        record["key"] = key
+        if not _should_retire_stale_vinted_pickup(record, current_ids, current_accounts):
+            continue
         extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
-        title = clean_text(str(extra.get("vinted_item_title") or record.get("item_title") or ""))
-        return title or "Vinted"
-    shop = clean_text(str(record.get("shop") or ""))
-    if shop:
-        return shop
-    return _carrier_title(record.get("carrier"))
+        record["status"] = STATUS_PICKED_UP
+        record["expected_date"] = None
+        record["delivery_window_start"] = None
+        record["delivery_window_end"] = None
+        record["pickup_location"] = None
+        record["pickup_code"] = None
+        record["source"] = "vinted_sidecar_stale_retired"
+        record["confidence"] = "high"
+        record["extra"] = {
+            **extra,
+            "picked_up_at": extra.get("picked_up_at") or now,
+            "vinted_retired_at": now,
+            "vinted_retired_reason": "missing_from_current_vinted_sidecar_refresh",
+        }
+        retired.append(record)
+    return retired
+
+
+def _vinted_current_record_ids(records: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        for value in (record.get("key"), record.get("tracking_code"), extra.get("vinted_id"), extra.get("vinted_thread_id")):
+            text = clean_text(str(value or "")).lower()
+            if text:
+                ids.add(text)
+    return ids
+
+
+def _vinted_current_accounts(records: list[dict[str, Any]]) -> set[str]:
+    accounts: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+        account = clean_text(str(extra.get("vinted_account") or "")).lower()
+        if account:
+            accounts.add(account)
+    return accounts
+
+
+def _should_retire_stale_vinted_pickup(
+    record: dict[str, Any],
+    current_ids: set[str],
+    current_accounts: set[str],
+) -> bool:
+    if record.get("status") != STATUS_READY_FOR_PICKUP or not _record_has_vinted_source(record):
+        return False
+    if record.get("pickup_location") or record.get("pickup_code") or record.get("pickup_deadline"):
+        return False
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    if extra.get("pickup_deadline") or extra.get("pickup_location") or extra.get("pickup_code"):
+        return False
+    account = clean_text(str(extra.get("vinted_account") or "")).lower()
+    if current_accounts and account and account not in current_accounts:
+        return False
+    own_ids = {
+        clean_text(str(value or "")).lower()
+        for value in (record.get("key"), record.get("tracking_code"), extra.get("vinted_id"), extra.get("vinted_thread_id"))
+        if clean_text(str(value or ""))
+    }
+    if own_ids & current_ids:
+        return False
+    return _vinted_record_age_days(record) >= 14
+
+
+def _vinted_record_age_days(record: dict[str, Any]) -> int:
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    for value in (extra.get("vinted_last_update"), record.get("updated_at"), extra.get("vinted_retired_at")):
+        parsed = _parse_iso_datetime(value)
+        if not parsed:
+            continue
+        reference = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        return max(0, (reference - parsed).days)
+    return 0
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _email_exclusion_reason(fields: dict[str, str]) -> str | None:

@@ -25,6 +25,10 @@ from addons.parcels_fedex_scraper.app.main import (
     vinted_page_looks_logged_out,
     vinted_text_looks_register_form,
     vinted_carrier_tracking_from_values,
+    vinted_api_result_needs_pickup_enrichment,
+    vinted_pickup_deadline,
+    vinted_pickup_point_from_any,
+    vinted_records_need_pickup_enrichment,
 )
 
 
@@ -350,6 +354,129 @@ def test_vinted_api_conversation_extracts_structured_chronopost_pickup():
     assert record["extra"]["carrier_tracking"]["carrier"] == "chronopost"
     assert record["extra"]["carrier_tracking"]["tracking_code"] == "XU152297803JF"
     assert record["extra"]["vinted_thread_id"] == "77"
+
+
+def test_vinted_api_conversation_extracts_pickup_point_object_and_deadline():
+    package = vinted_package_from_conversation(
+        {"id": 88, "last_message_at": "2026-05-07T13:20:00Z"},
+        {
+            "conversation": {
+                "id": 88,
+                "other_user": {"login": "marloesw-91"},
+                "transaction": {
+                    "id": 18476234326,
+                    "shipment": {
+                        "id": 18476234326,
+                        "tracking_status": "ready_for_pickup",
+                        "pickup_code": "034049",
+                        "pickup_deadline": "2026-05-13T20:59:00+02:00",
+                        "pickup_point": {
+                            "name": "DROOMVISIE",
+                            "address": {
+                                "street": "Schoolstraat",
+                                "house_number": "109A",
+                                "postcode": "2251 BG",
+                                "city": "Voorschoten",
+                            },
+                        },
+                    },
+                    "item": {"title": "Vest 128"},
+                },
+            }
+        },
+    )
+
+    assert package is not None
+    assert package["status"] == "ready_for_pickup"
+    assert package["pickup_point"] == "DROOMVISIE, Schoolstraat 109A, 2251 BG, Voorschoten"
+    assert package["pickup_code"] == "034049"
+    assert package["pickup_deadline"] == "2026-05-13"
+
+    record = vinted_record_from_api_package(
+        package,
+        account_key="account_1",
+        source_url="https://www.vinted.nl/inbox/88",
+    )
+
+    assert record is not None
+    assert record["pickup_location"] == "DROOMVISIE, Schoolstraat 109A, 2251 BG, Voorschoten"
+    assert record["pickup_code"] == "034049"
+    assert record["extra"]["pickup_deadline"] == "2026-05-13"
+    assert record["extra"]["vinted_item_title"] == "Vest 128"
+
+
+def test_vinted_pickup_enrichment_detects_half_api_records_only():
+    assert vinted_records_need_pickup_enrichment(
+        [
+            {
+                "carrier": "vinted",
+                "status": "ready_for_pickup",
+                "extra": {"vinted_item_title": "Vest 128"},
+            }
+        ]
+    )
+    assert not vinted_records_need_pickup_enrichment(
+        [
+            {
+                "carrier": "vinted",
+                "status": "ready_for_pickup",
+                "pickup_code": "034049",
+            }
+        ]
+    )
+    assert not vinted_records_need_pickup_enrichment(
+        [
+            {
+                "carrier": "vinted",
+                "status": "in_transit",
+                "extra": {"vinted_item_title": "Vest 128"},
+            }
+        ]
+    )
+
+
+def test_vinted_api_result_needs_pickup_enrichment_only_for_ok_half_pickups():
+    assert vinted_api_result_needs_pickup_enrichment(
+        {
+            "status": "ok",
+            "records": [
+                {
+                    "carrier": "vinted",
+                    "status": "ready_for_pickup",
+                    "extra": {"vinted_item_title": "Vest 128"},
+                }
+            ],
+        }
+    )
+    assert not vinted_api_result_needs_pickup_enrichment(
+        {
+            "status": "api_auth_failed",
+            "records": [
+                {
+                    "carrier": "vinted",
+                    "status": "ready_for_pickup",
+                }
+            ],
+        }
+    )
+
+
+def test_vinted_text_pickup_deadline_accepts_month_names():
+    assert vinted_pickup_deadline("Haal het op vóór 13 mei 2026 bij het pakketpunt.") == "2026-05-13"
+
+
+def test_vinted_pickup_point_from_any_accepts_structured_address():
+    assert (
+        vinted_pickup_point_from_any(
+            {
+                "name": "HEMA LEIDSCHENDAM",
+                "address_line1": "DAMLAAN 44",
+                "postal_code": "2265 AP",
+                "city": "LEIDSCHENDAM",
+            }
+        )
+        == "HEMA LEIDSCHENDAM, DAMLAAN 44, 2265 AP, LEIDSCHENDAM"
+    )
 
 
 def test_vinted_api_conversation_extracts_product_eta_range_and_timeline():

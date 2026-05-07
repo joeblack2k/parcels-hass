@@ -1588,6 +1588,48 @@ async def scrape_vinted_parcels(
                 timeout=per_account_timeout,
                 api_result=result,
             )
+        elif vinted_records_need_pickup_enrichment(
+            result.get("records") if isinstance(result.get("records"), list) else []
+        ):
+            enrichment_timeout = max(per_account_timeout, int(settings.timeout))
+            enriched_result = await run_vinted_browser_fallback(
+                app,
+                account=account,
+                debug=debug,
+                timeout=enrichment_timeout,
+                api_result=result,
+            )
+            enriched_records = (
+                enriched_result.get("records") if isinstance(enriched_result.get("records"), list) else []
+            )
+            enrichment_diagnostics = {
+                "status": enriched_result.get("status") or "unknown",
+                "records": len(enriched_records),
+            }
+            result_diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+            if enriched_records:
+                existing_records = result.get("records") if isinstance(result.get("records"), list) else []
+                result = {
+                    **result,
+                    "records": dedupe_vinted_records(
+                        [
+                            *(record for record in existing_records if isinstance(record, dict)),
+                            *(record for record in enriched_records if isinstance(record, dict)),
+                        ]
+                    ),
+                    "diagnostics": {
+                        **result_diagnostics,
+                        "browser_pickup_enrichment": enrichment_diagnostics,
+                    },
+                }
+            else:
+                result = {
+                    **result,
+                    "diagnostics": {
+                        **result_diagnostics,
+                        "browser_pickup_enrichment": enrichment_diagnostics,
+                    },
+                }
 
         account_records = result.get("records") if isinstance(result.get("records"), list) else []
         records.extend(record for record in account_records if isinstance(record, dict))
@@ -1621,6 +1663,11 @@ def vinted_account_state(app: web.Application, account: VintedAccount) -> dict[s
     states = app.get("vinted_login_states") if isinstance(app.get("vinted_login_states"), dict) else {}
     state = states.get(account.key) if isinstance(states, dict) else None
     return state if isinstance(state, dict) else {}
+
+
+def vinted_api_result_needs_pickup_enrichment(api_result: dict[str, Any]) -> bool:
+    records = api_result.get("records") if isinstance(api_result.get("records"), list) else []
+    return api_result.get("status") == "ok" and vinted_records_need_pickup_enrichment(records)
 
 
 def vinted_login_needs_manual_attention(status: str) -> bool:
@@ -1822,7 +1869,7 @@ async def run_vinted_browser_fallback(
                     "api_client": api_result.get("diagnostics") if isinstance(api_result.get("diagnostics"), dict) else {},
                 },
             }
-        if settings.vinted_auto_login and state_status != "ok":
+        if settings.vinted_auto_login and state_status != "ok" and not vinted_api_result_needs_pickup_enrichment(api_result):
             login_timeout = min(timeout, vinted_login_attempt_timeout(settings))
             try:
                 login_result = await asyncio.wait_for(
@@ -2222,6 +2269,11 @@ async def run_vinted_parcel_scrape(
         "json_payloads": 0,
     }
     debug_samples: list[str] = []
+    preflight_records = api_result.get("records") if isinstance(api_result.get("records"), list) else []
+    needs_pickup_enrichment = debug or vinted_records_need_pickup_enrichment(preflight_records)
+    for link in vinted_detail_links_from_records(preflight_records):
+        if link not in detail_links:
+            detail_links.append(link)
 
     async def capture_response(response) -> None:
         if not is_vinted_json_response(response.url):
@@ -2264,13 +2316,17 @@ async def run_vinted_parcel_scrape(
             diagnostics["pages"] += 1
 
         diagnostics["detail_links"] = len(detail_links)
-        for url in detail_links[:2]:
+        detail_limit = 8 if needs_pickup_enrichment else 2
+        for url in detail_links[:detail_limit]:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=vinted_page_timeout(settings) * 1000)
             except PlaywrightError:
                 continue
             await dismiss_vinted_overlays(page)
             await wait_for_vinted_settle(page, settings.timeout)
+            if needs_pickup_enrichment:
+                await click_vinted_tracking_control(page)
+                await wait_for_vinted_settle(page, settings.timeout)
             text = await safe_body_text(page)
             if text:
                 page_texts.append((url, text))
@@ -2285,7 +2341,7 @@ async def run_vinted_parcel_scrape(
         records: list[dict[str, Any]] = []
         for source_url, payload in json_payloads:
             records.extend(vinted_records_from_json(payload, account_key=account.key, source_url=source_url))
-        if records:
+        if records and not vinted_records_need_pickup_enrichment(records):
             return {"status": "ok", "records": dedupe_vinted_records(records), "diagnostics": diagnostics}
         for source_url, text in page_texts:
             record = vinted_record_from_text(text, account_key=account.key, source_url=source_url)
@@ -2371,6 +2427,34 @@ async def extract_vinted_detail_links(page) -> list[str]:
         if any(hint in text.lower() for hint in VINTED_LINK_HINTS):
             results.append(text)
     return results[:30]
+
+
+def vinted_detail_links_from_records(records: list[Any]) -> list[str]:
+    links: list[str] = []
+    for record in records:
+        if not vinted_record_needs_pickup_enrichment(record):
+            continue
+        extra = record.get("extra") if isinstance(record, dict) and isinstance(record.get("extra"), dict) else {}
+        for value in (extra.get("vinted_source_url"), record.get("tracking_url") if isinstance(record, dict) else None):
+            link = str(value or "").split("#", 1)[0].strip()
+            if link.startswith(VINTED_HOME) and link not in links:
+                links.append(link)
+    return links[:8]
+
+
+async def click_vinted_tracking_control(page) -> bool:
+    for label in (
+        "Pakket volgen",
+        "Volg pakket",
+        "Trackingpagina",
+        "Track parcel",
+        "Track package",
+        "View tracking",
+    ):
+        if await click_vinted_control(page, label):
+            await page.wait_for_timeout(800)
+            return True
+    return False
 
 
 def is_vinted_json_response(url: str) -> bool:
@@ -2955,7 +3039,7 @@ def vinted_package_from_conversation(
             ),
         )
     )
-    pickup_point = vinted_as_str(
+    pickup_point = vinted_pickup_point_from_any(
         vinted_first_by_keys(
             combined,
             (
@@ -2963,10 +3047,14 @@ def vinted_package_from_conversation(
                 "pickup_point_name",
                 "collection_point",
                 "parcel_shop",
+                "parcel_shop_name",
                 "locker_name",
+                "pickup_address",
+                "collection_address",
             ),
         )
     )
+    pickup_point = pickup_point or vinted_pickup_location(text)
     pickup_code = vinted_as_str(vinted_first_key_contains(combined, ("pickup", "code")))
     pickup_code = pickup_code or vinted_as_str(vinted_first_key_contains(combined, ("collection", "code")))
     pickup_code = pickup_code or vinted_as_str(vinted_first_key_contains(combined, ("locker", "code")))
@@ -3144,6 +3232,65 @@ def vinted_as_str(value: Any) -> str | None:
         stripped = value.strip()
         return stripped or None
     return None
+
+
+def vinted_pickup_point_from_any(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return clean_vinted_location(value)
+    if not isinstance(value, dict):
+        return ""
+
+    name = first_vinted_dict_string(
+        value,
+        (
+            "name",
+            "title",
+            "pickup_point_name",
+            "collection_point_name",
+            "parcel_shop_name",
+            "locker_name",
+        ),
+    )
+    address = vinted_address_from_dict(value)
+    nested_address = value.get("address")
+    if not address and isinstance(nested_address, dict):
+        address = vinted_address_from_dict(nested_address)
+    elif not address and isinstance(nested_address, str):
+        address = clean_vinted_location(nested_address)
+
+    pieces = [piece for piece in (name, address) if piece]
+    return clean_vinted_location(", ".join(pieces))
+
+
+def vinted_address_from_dict(value: dict[str, Any]) -> str:
+    direct = first_vinted_dict_string(
+        value,
+        (
+            "formatted_address",
+            "full_address",
+            "address_line",
+            "address_line1",
+            "street_address",
+        ),
+    )
+    street = first_vinted_dict_string(value, ("street", "street_name", "route"))
+    number = first_vinted_dict_string(value, ("house_number", "street_number", "building_number"))
+    postal = first_vinted_dict_string(value, ("postcode", "postal_code", "zip"))
+    city = first_vinted_dict_string(value, ("city", "town", "locality"))
+
+    street_line = " ".join(piece for piece in (street, number) if piece)
+    pieces = [piece for piece in (direct, street_line, postal, city) if piece]
+    return clean_vinted_location(", ".join(pieces))
+
+
+def first_vinted_dict_string(value: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        text = vinted_as_str(value.get(key))
+        if text:
+            return clean_vinted_location(text)
+    return ""
 
 
 VINTED_MONTHS = {
@@ -3795,8 +3942,16 @@ def clean_vinted_location(value: str) -> str:
 
 
 def vinted_pickup_deadline(text: str) -> str:
-    match = re.search(r"\b(?:ophalen voor|ophalen vóór|pick up by)\D{0,30}(\d{1,2}[-/]\d{1,2}[-/]\d{4})", text, re.IGNORECASE)
-    return date_from_any(match.group(1)) if match else ""
+    match = re.search(
+        r"\b(?:ophalen\s+(?:voor|vóór|tot)|haal(?:\s+het)?\s+op\s+(?:voor|vóór|tot)|"
+        r"pick\s+up\s+by|pickup\s+deadline|collect\s+by)\D{0,40}"
+        r"([A-Za-zÀ-ÿ0-9 /\-.]{4,40})",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return vinted_date_from_any(match.group(1)) or date_from_any(match.group(1))
 
 
 def vinted_tracking_code_from_text(text: str) -> str:
@@ -3862,6 +4017,26 @@ def dedupe_vinted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(deduped.values())
 
 
+def vinted_records_need_pickup_enrichment(records: list[Any]) -> bool:
+    return any(vinted_record_needs_pickup_enrichment(record) for record in records)
+
+
+def vinted_record_needs_pickup_enrichment(record: Any) -> bool:
+    if not isinstance(record, dict) or record.get("status") != "ready_for_pickup":
+        return False
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
+    return not any(
+        (
+            record.get("pickup_location"),
+            record.get("pickup_code"),
+            record.get("pickup_deadline"),
+            extra.get("pickup_deadline"),
+            extra.get("pickup_location"),
+            extra.get("pickup_code"),
+        )
+    )
+
+
 def vinted_record_key(record: dict[str, Any]) -> str:
     extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
     reference = extra.get("carrier_tracking") if isinstance(extra.get("carrier_tracking"), dict) else {}
@@ -3884,7 +4059,10 @@ def vinted_record_score(record: dict[str, Any]) -> tuple[int, int]:
         "in_transit": 20,
         "unknown": 0,
     }.get(status, 0)
+    extra = record.get("extra") if isinstance(record.get("extra"), dict) else {}
     detail_score = sum(1 for key in ("pickup_location", "pickup_code", "expected_date", "tracking_url") if record.get(key))
+    if record.get("pickup_deadline") or extra.get("pickup_deadline"):
+        detail_score += 1
     return (status_score, detail_score)
 
 
